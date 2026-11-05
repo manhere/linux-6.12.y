@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * HiSilicon CV200 V4R3 and MV310 V5R6 VDH video decoders.
- * The request frontend is shared; hardware messages and lifecycle are selected
- * per engine. MV310 definitions follow the recovered shipped VFMW v5.1 HAL.
+ * HiSilicon Hi3798CV200 VDH video decoder
+ *
+ * Copyright (C) 2026 HiSilicon Technologies Co., Ltd.
  */
 
 #include <linux/bitfield.h>
@@ -10,6 +10,14 @@
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/iosys-map.h>
+/* 6.18 renamed/added file_to_v4l2_fh() in <media/v4l2-fh.h>; the 6.12 tree
+ * this driver is built against predates it, so provide the same helper.
+ */
+static inline struct v4l2_fh *file_to_v4l2_fh(struct file *file)
+{
+	return file->private_data;
+}
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/histb-vpss.h>
@@ -23,12 +31,10 @@
 #include <linux/platform_device.h>
 #include <linux/dma-map-ops.h>
 #include <linux/of_address.h>
-#include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/pm_runtime.h>
 #include <linux/printk.h>
 #include <linux/regmap.h>
-#include <linux/refcount.h>
 #include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
@@ -40,25 +46,56 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-fh.h>
+#include <media/v4l2-h264.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
 #include <media/v4l2-vp9.h>
 #include <media/videobuf2-dma-contig.h>
-#include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-memops.h>
+#include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
 #include "histb-vdec-mpeg4.h"
 #include "histb-vdec-vc1.h"
-#include "histb-vdec-mvc-ingress.h"
+#include "histb-dma.h"
 #include "histb-vpss.h"
-#include "histb-media-smmu.h"
-#include "histb-vdec-v5r6.h"
-#include "histb-vdec-avs2.h"
-#include "histb-vdec-mpeg1.h"
 
 static const struct v4l2_event histb_vdec_eos_event = {
 	.type = V4L2_EVENT_EOS,
+};
+
+/*
+ * A/B switch for the open question of who removes H.264 emulation-prevention
+ * bytes.  The community driver strips them in software and hands the VDH an
+ * RBSP (default, false).  The vendor VFMW never strips them anywhere in its
+ * software (no EPB code in syntax/h264, bitstream.S BsGet reads raw bytes) and
+ * passes raw NAL positions, which implies the VDH (or the SCD that the vendor
+ * uses to cut the stream) removes them in hardware.  true feeds the raw EBSP
+ * and converts header_bit_size (RBSP domain, as GStreamer and the uAPI define
+ * it) to the EBSP position.  Read once per slice, so it can be flipped through
+ * /sys/module/histb_vdec/parameters/ between two runs.
+ */
+static bool h264_raw_ebsp;
+module_param(h264_raw_ebsp, bool, 0644);
+MODULE_PARM_DESC(h264_raw_ebsp,
+		 "H.264: feed raw EBSP (keep 00 00 03) instead of RBSP (default: RBSP)");
+
+#define HISTB_VDEC_H264_DIAG_SLICES	4
+
+struct histb_vdec_h264_diag {
+	u32 picture;		/* ctx->h264_pictures when the slice was queued */
+	u32 ebsp_bytes;		/* NAL as the client sent it, header byte included */
+	u32 fed_bytes;		/* bytes the VDH sees (RBSP, or EBSP when raw) */
+	u32 epb;		/* 00 00 03 sequences in the NAL */
+	u32 rbsp_hazards;	/* RBSP 00 00 0x (x <= 3): what an EPB stripper mis-reads */
+	u32 header_bit_size;	/* from the client, RBSP domain */
+	u32 header_bits;	/* bit position given to the VDH */
+	u32 valid_bits;		/* slice-message word 2 */
+	u32 tail_bits;		/* trailing bits removed (stop bit kept for CABAC) */
+	u32 first_mb;
+	u8 slice_type;
+	bool raw;
+	u8 head[8];		/* first bytes of slice data at header_bits / 8 */
 };
 
 #define HISTB_VDEC_START		0x0000
@@ -122,7 +159,6 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_SMMU_FAULT_RD_NS	0xf360
 #define HISTB_VDEC_SMMU_ERR_RD_ADDR	0xf304
 #define HISTB_VDEC_SMMU_ERR_WR_ADDR	0xf308
-#define HISTB_VDEC_SMMU_PGTABLE_ADDR	0xf20c
 
 
 #define HISTB_CRG_VDH_CLOCK		0x0078
@@ -154,7 +190,6 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_BASIC_CFG0_MPEG2	0x41400000
 #define HISTB_VDEC_BASIC_CFG0_VP8	0x00000000
 #define HISTB_VDEC_BASIC_CFG0_VP9	0x00000000
-#define HISTB_VDEC_BASIC_CFG0_AVS	0x41400000
 #define HISTB_VDEC_BASIC_CFG1_I_SLICE	0x0001c000
 #define HISTB_VDEC_BASIC_CFG1_NEW_PIC	BIT(14)
 #define HISTB_VDEC_BASIC_CFG1_VC1	0x0001c001
@@ -164,9 +199,6 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_BASIC_CFG1_MAX_SLICE_GROUP	GENMASK(27, 16)
 #define HISTB_VDEC_BASIC_CFG1_VP8	0x0000c00c
 #define HISTB_VDEC_BASIC_CFG1_VP9	0x0003c00e
-#define HISTB_VDEC_BASIC_CFG1_AVS	(6 | BIT(14) | BIT(16))
-#define HISTB_VDEC_BASIC_CFG1_AVS_MV_OUT	BIT(15)
-#define HISTB_VDEC_BASIC_CFG1_AVS_MMU_EN	BIT(12)
 
 #define HISTB_VDEC_PIC_WIDTH		GENMASK(8, 0)
 #define HISTB_VDEC_PIC_STRUCTURE	GENMASK(15, 14)
@@ -201,8 +233,17 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_SLICE_BETA		GENMASK(11, 8)
 #define HISTB_VDEC_SLICE_ALPHA		GENMASK(19, 16)
 
-/* The H.264 message has 16 reference addresses followed by CABAC and POCs. */
-#define HISTB_VDEC_H264_DPB_SIZE	16
+/*
+ * H.264 allows at most 16 reference frames, but MVC decodes one view per
+ * picture with both views sharing this DPB, so the APC has to hold both
+ * views' references: the vendor's MVC_MAX_FRAME_STORE is 40.  The array is
+ * one of pointers, so the extra slots cost nothing worth counting, and the
+ * loops that walk it treat an empty slot as absent.
+ *
+ * dpb_to_apc stays sized by the H.264 limit, because that array maps the
+ * client's DPB entries, which the standard caps at 16 regardless of view.
+ */
+#define HISTB_VDEC_H264_DPB_SIZE	40
 #define HISTB_VDEC_H264_DPB_MAP_SIZE	16
 #define HISTB_VDEC_APC_INVALID		(-1)
 
@@ -224,19 +265,21 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_VP9_MAX_HEIGHT	2304U
 #define HISTB_VDEC_HEVC_MAX_WIDTH	4096U
 #define HISTB_VDEC_HEVC_MAX_HEIGHT	2304U
-#define HISTB_VDEC_AVS_MAX_WIDTH	1920U
-#define HISTB_VDEC_AVS_MAX_HEIGHT	1088U
 #define HISTB_VDEC_DEFAULT_WIDTH	1280U
 #define HISTB_VDEC_DEFAULT_HEIGHT	720U
 #define HISTB_VDEC_MIN_BITSTREAM	SZ_4K
 #define HISTB_VDEC_MAX_BITSTREAM	SZ_8M
 #define HISTB_VDEC_DEFAULT_BITSTREAM	SZ_1M
 #define HISTB_VDEC_WATCHDOG_MS		2000
+/* Upper bound for any wait that can run under the device-wide vfd->lock. */
+#define HISTB_VDEC_IDLE_WAIT_MS		5000
 #define HISTB_VDEC_VC1_BPD_TIMEOUT_MS	4000
 #define HISTB_VDEC_VC1_BPD_MODE_ROWSKIP	5
 #define HISTB_VDEC_RAW_STREAM_GUARD	64U
 
 #define HISTB_VDEC_H264_MSG_SLOT_SIZE	SZ_1K
+/* Private control: V4L2_CID_USER_BASE + 0x1d00 ("Deinterlace": 0 off, 1 VPSS motion adaptive). */
+#define HISTB_VDEC_CID_DEINTERLACE	(V4L2_CID_USER_BASE + 0x1d00)
 #define HISTB_VDEC_H264_MAX_SLICES	136
 #define HISTB_VDEC_HEVC_MSG_SLOT_WORDS	320
 #define HISTB_VDEC_HEVC_MSG_SLOT_SIZE	\
@@ -252,28 +295,14 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_H264_CABAC_FIRMWARE	"hisilicon/histb-h264-cabac.bin"
 #define HISTB_VDEC_HEVC_CABAC_SIZE	928
 #define HISTB_VDEC_HEVC_CABAC_FIRMWARE	"hisilicon/histb-hevc-cabac.bin"
-#define HISTB_VDEC_AVSP_FIRMWARE		"hisilicon/histb-avsp.bin"
-#define HISTB_VDEC_AVSP_FIRMWARE_SIZE	17920U
-#define HISTB_VDEC_AVSP_FIRMWARE_ALIGN	128U
-#define HISTB_VDEC_AVS_PROFILE_JIZHUN	0x20
-#define HISTB_VDEC_AVS_PROFILE_GUANGDIAN	0x48
-#define HISTB_VDEC_AVS_START_SLICE_MAX	0xaf
-#define HISTB_VDEC_AVS_PIC_MSG_WORDS	80U
-#define HISTB_VDEC_AVS_PIC_MSG_SIZE	\
-	(HISTB_VDEC_AVS_PIC_MSG_WORDS * sizeof(__le32))
-#define HISTB_VDEC_AVS_SLICE_MSG_WORDS	64U
-#define HISTB_VDEC_AVS_SLICE_MSG_SIZE	\
-	(HISTB_VDEC_AVS_SLICE_MSG_WORDS * sizeof(__le32))
-#define HISTB_VDEC_AVS_MAX_SLICES	200U
-#define HISTB_VDEC_AVS_UP_MSG_SIZE	\
-	(HISTB_VDEC_AVS_MAX_SLICES * 4U * sizeof(__le32))
-#define HISTB_VDEC_AVS_PIC_MSG_OFFSET	ALIGN(HISTB_VDEC_AVS_UP_MSG_SIZE, SZ_4K)
-#define HISTB_VDEC_AVS_SLICE_MSG_OFFSET	\
-	(HISTB_VDEC_AVS_PIC_MSG_OFFSET + HISTB_VDEC_AVS_PIC_MSG_SIZE)
-#define HISTB_VDEC_AVS_MSG_SIZE	\
-	ALIGN(HISTB_VDEC_AVS_SLICE_MSG_OFFSET + \
-	      HISTB_VDEC_AVS_MAX_SLICES * HISTB_VDEC_AVS_SLICE_MSG_SIZE, SZ_4K)
 #define HISTB_VDEC_MAX_UP_REPORTS	200
+/*
+ * An 8 MiB-and-up capture buffer is a 4K geometry: 12.4 MB each, and every
+ * decoded buffer also owns a ~12.5 MB tile surface while it is a reference.
+ * Sized for cma=320M: 16 x 12.4 MB of capture buffers leaves ~120 MB for the
+ * surfaces.  On a 192 MiB CMA area eleven was the most that fitted.
+ */
+#define HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS	16
 #define HISTB_VDEC_HEVC_MAX_ENTRY_POINTS	256
 #define HISTB_VDEC_HEVC_MAX_SLICES	HISTB_VDEC_MAX_UP_REPORTS
 #define HISTB_VDEC_HEVC_MAX_TILE_COLUMNS	10
@@ -339,12 +368,12 @@ enum histb_vdec_buffer_id {
 	HISTB_VDEC_BUF_RCN_TOP,
 	HISTB_VDEC_BUF_COLMB,
 	HISTB_VDEC_BUF_TILE_SEG,
+	HISTB_VDEC_BUF_APC_MV,
 	HISTB_VDEC_BUF_SAO_LEFT,
 	HISTB_VDEC_BUF_SAO_TOP,
 	HISTB_VDEC_BUF_DBLK_LEFT,
 	HISTB_VDEC_BUF_DBLK_TOP,
 	HISTB_VDEC_BUF_PPFD,
-	HISTB_VDEC_BUF_AVS_DNR_MBINFO,
 	HISTB_VDEC_BUF_VP8_PROB,
 	HISTB_VDEC_BUF_VP8_SEG,
 	HISTB_VDEC_BUF_VP9_PROB,
@@ -371,12 +400,12 @@ static const size_t histb_vdec_buffer_sizes[HISTB_VDEC_BUF_COUNT] = {
 	[HISTB_VDEC_BUF_RCN_TOP] = SZ_512K,
 	[HISTB_VDEC_BUF_COLMB] = SZ_512K,
 	[HISTB_VDEC_BUF_TILE_SEG] = SZ_256K,
+	[HISTB_VDEC_BUF_APC_MV] = SZ_4K,
 	[HISTB_VDEC_BUF_SAO_LEFT] = SZ_512K,
 	[HISTB_VDEC_BUF_SAO_TOP] = SZ_512K,
 	[HISTB_VDEC_BUF_DBLK_LEFT] = SZ_512K,
 	[HISTB_VDEC_BUF_DBLK_TOP] = SZ_512K,
 	[HISTB_VDEC_BUF_PPFD] = SZ_256K,
-	[HISTB_VDEC_BUF_AVS_DNR_MBINFO] = SZ_32K,
 	[HISTB_VDEC_BUF_VP8_PROB] = ALIGN(HISTB_VDEC_VP8_PROB_SIZE, SZ_4K),
 	[HISTB_VDEC_BUF_VP8_SEG] = HISTB_VDEC_VP8_SEG_SIZE,
 	[HISTB_VDEC_BUF_VP9_PROB] = HISTB_VDEC_VP9_PROB_SIZE,
@@ -405,12 +434,6 @@ struct histb_vdec_hevc_stream {
 	u32 valid_bits;
 };
 
-
-struct histb_vdec_avs_stream {
-	u32 data_offset;
-	u32 size;
-};
-
 struct histb_vdec_hevc_tiles {
 	u32 columns;
 	u32 rows;
@@ -427,22 +450,11 @@ struct histb_vdec_mpeg2_slice {
 	bool intra;
 };
 
-struct histb_vdec_avs_metadata {
-	bool valid;
-	bool anchor;
-	bool interlaced;
-	bool top_field_first;
-	u8 picture_structure;
-	u8 picture_coding_type;
-	u16 picture_distance;
-};
-
 struct histb_vdec_decoded_buffer {
 	/* Must be first for the v4l2-mem2mem ready-queue helpers. */
 	struct v4l2_m2m_buffer base;
 	struct histb_vdec_dma_buffer tile;
 	struct histb_vdec_dma_buffer pmv;
-	struct histb_vdec_avs_metadata avs;
 	bool tile_noncoherent;
 	bool pmv_noncoherent;
 	/* A decoded surface remains bad until userspace QBUF starts a new life. */
@@ -455,11 +467,6 @@ struct histb_vdec_decoded_buffer {
 	s8 vp9_logic_id;
 	u16 vp9_width;
 	u16 vp9_height;
-};
-
-struct histb_vdec_avs_reference {
-	struct histb_vdec_decoded_buffer *decoded;
-	const struct histb_vdec_avs_metadata *metadata;
 };
 
 struct histb_vdec_mpeg4_anchor {
@@ -502,59 +509,25 @@ struct histb_vdec_q_data {
 	struct v4l2_pix_format pix;
 	u32 sequence;
 };
-struct histb_vdec_avs2 {
-	struct mutex lock;
-	struct histb_avs2_ctx decoder;
-	struct histb_avs2_au au;
-	struct histb_avs2_job job;
-	struct histb_avs2_output output;
-	struct histb_vdec_decoded_buffer surface[HISTB_AVS2_SLOTS];
-	struct completion done;
-	u32 state;
-	u32 smmu_secure;
-	u32 smmu_nonsecure;
-	s8 output_slot;
-	bool au_valid;
-	bool output_valid;
-	bool drain;
-	bool barrier;
-	bool source_change;
-	bool capture_configured;
-	bool eos;
-	bool aborted;
-};
-
-struct histb_vdec_mpeg1 {
-	struct mutex lock;
-	struct histb_mpeg1_ctx decoder;
-	struct histb_mpeg1_au au;
-	struct histb_mpeg1_job job;
-	struct histb_mpeg1_output output;
-	struct histb_vdec_decoded_buffer surface[HISTB_MPEG1_SLOTS];
-	struct completion done;
-	u32 state, smmu_secure, smmu_nonsecure;
-	s8 output_slot;
-	bool au_valid, output_valid, drain, source_change;
-	bool capture_configured, eos, aborted;
-};
-
 
 struct histb_vdec_dev;
 
 struct histb_vdec_ctx {
 	struct v4l2_fh fh;
+	/* Hardware deinterlace (VPSS DEI): see histb_vdec_deinterlace(). */
+	bool deint_interlaced;		/* the picture being decoded is interlaced */
+	bool deint_tff;			/* ... and its first field is the top one */
+	bool deint_prev_valid;		/* deint_w[deint_cur ^ 1] holds the previous woven frame */
+	unsigned int deint_cur;
+	struct histb_vdec_dma_buffer deint_w[2];	/* woven NV12, ping-pong */
+	bool mplane;		/* opened on the multi-planar node: *_MPLANE buffer types */
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct histb_vdec_dev *vdec;
-	struct histb_vdec_avs2 *avs2;
-	struct histb_vdec_mpeg1 *mpeg1;
 	struct histb_vdec_q_data src;
 	struct histb_vdec_q_data dst;
-	struct histb_vpss_pq_settings pq_settings;
 	/* Serializes MPEG-4 AU/display completion with decoder commands. */
 	struct mutex mpeg4_lock;
 	struct histb_vdec_dma_buffer buffers[HISTB_VDEC_BUF_COUNT];
-	/* AVS only: one allocation carries every entry of buffers[]. */
-	struct histb_vdec_dma_buffer buf_arena;
 	struct histb_vdec_dma_buffer bitstream;
 	/* HEVC RBSP conversion is CPU-heavy; keep its staging buffer cacheable. */
 	void *hevc_stream_shadow;
@@ -577,6 +550,10 @@ struct histb_vdec_ctx {
 	u32 h264_first_mb;
 	u32 h264_last_first_mb;
 	size_t h264_stream_bytes;
+	/* Per-slice bitstream facts, printed when the VDH reports a failure. */
+	struct histb_vdec_h264_diag h264_diag[HISTB_VDEC_H264_DIAG_SLICES];
+	u32 h264_pictures;
+	bool h264_raw;		/* this picture is fed as EBSP (h264_raw_ebsp) */
 	u16 h264_slices;
 	bool h264_controls_valid;
 	struct v4l2_ctrl_h264_decode_params h264_decode;
@@ -598,15 +575,9 @@ struct histb_vdec_ctx {
 	bool h264_pending_failed;
 	bool h264_cabac_loaded;
 	bool hevc_cabac_loaded;
-	bool avs;
-	u16 avs_slices;
-	u32 avs_total_mbs;
-	u32 avs_basic_cfg1;
-	u8 avs_profile;
 	bool hevc;
 	bool hevc_main10;
 	bool hevc_scaling_list;
-	u8 hevc_ctb_log2;
 	u16 hevc_slices;
 	u16 mpeg2_slices;
 	bool mpeg2;
@@ -631,12 +602,6 @@ struct histb_vdec_ctx {
 	struct histb_vdec_decoded_buffer *mpeg2_pending_field;
 	/* MPEG-2 B pictures can straddle an I-picture boundary. */
 	struct histb_vdec_decoded_buffer *mpeg2_anchor[2];
-	struct histb_mvc_ingress mvc_ingress;
-	struct mutex mvc_lock;
-	u8 *mvc_rbsp;
-	u32 mvc_rbsp_size;
-	/* Native MVC's final PMV slot is an independent, zero-backed store. */
-	struct histb_vdec_dma_buffer mvc_pmv;
 	bool mpeg4;
 	bool mpeg4_pending_valid;
 	u16 mpeg4_slices;
@@ -656,7 +621,6 @@ struct histb_vdec_ctx {
 	struct histb_vdec_mpeg4_anchor mpeg4_ref[2];
 	/* Serializes VC-1 reference and delayed-display ownership. */
 	struct mutex vc1_lock;
-	struct mutex rv_lock;
 	struct completion vc1_setup_idle;
 	bool vc1;
 	bool vc1_annex_l;
@@ -719,64 +683,21 @@ struct histb_vdec_ctx {
 	bool cabac;
 	bool mbaff;
 };
-enum histb_vdec_backend_cap {
-	HISTB_VDEC_BACKEND_AVSP = BIT(0),
-	HISTB_VDEC_BACKEND_VP8 = BIT(1),
-	HISTB_VDEC_BACKEND_VP9 = BIT(2),
-	HISTB_VDEC_BACKEND_AVS2 = BIT(3),
-	HISTB_VDEC_BACKEND_MPEG1 = BIT(4),
-	HISTB_VDEC_BACKEND_MVC = BIT(5),
-};
-
-struct histb_vdec_backend {
-	unsigned long caps;
-	const u32 *formats;
-	unsigned int num_formats;
-	size_t (*stream_guard)(u32 pixelformat);
-	u32 surface_tail_guard;
-	u32 (*surface_stride)(struct histb_vdec_ctx *ctx);
-	u32 (*surface_height_align)(struct histb_vdec_ctx *ctx);
-	size_t (*pmv_size)(struct histb_vdec_ctx *ctx);
-	int (*configure_clock)(struct histb_vdec_dev *vdec);
-	int (*reset_engine)(struct histb_vdec_dev *vdec);
-	int (*reset_vdh)(struct histb_vdec_dev *vdec);
-	int (*reset_bpd)(struct histb_vdec_dev *vdec);
-	bool (*completion_valid)(struct histb_vdec_ctx *ctx, u32 state,
-					const __le32 *up_msg, u32 smmu_secure,
-					u32 smmu_nonsecure);
-	void (*start)(struct histb_vdec_ctx *ctx, dma_addr_t picture,
-			dma_addr_t report, dma_addr_t stream,
-			dma_addr_t reconstruction, u32 basic_cfg0, u32 basic_cfg1);
-	void (*encode_h264_picture)(__le32 *picture, bool new_picture);
-	void (*encode_h264_slice)(__le32 *slice);
-	void (*encode_hevc_picture)(__le32 *picture);
-	void (*encode_hevc_slice)(__le32 *slice);
-	void (*encode_mpeg2_picture)(__le32 *picture);
-	void (*encode_mpeg2_slice)(__le32 *slice);
-	void (*encode_avs_picture)(__le32 *picture, unsigned int slice_count);
-	void (*encode_avs_slice)(__le32 *slice, u32 tail_offset);
-};
 
 struct histb_vdec_dev {
 	struct device *dev;
-	bool mv310;
-	const struct histb_vdec_backend *backend;
-	struct device *capture_dev;
 	void __iomem *regs;
 	struct regmap *crg;
 	struct histb_vpss *vpss;
 	struct clk_bulk_data clocks[3];
 	struct reset_control_bulk_data resets[4];
 	int irq;
-	struct histb_vdec_dma_buffer avsp_firmware;
-	/* CV200 AVS requires VDH translation even when DMA addresses are identity. */
-	struct histb_media_smmu smmu;
-	bool avsp_available;
-	bool avsp_loaded;
 
 	struct v4l2_device v4l2_dev;
 	struct media_device mdev;
-	struct video_device vfd;
+	struct video_device vfd;	/* single-planar node: V4L2_CAP_VIDEO_M2M */
+	struct media_intf_devnode *mp_intf;	/* media interface of vfd_mp */
+	struct video_device vfd_mp;	/* multi-planar node: V4L2_CAP_VIDEO_M2M_MPLANE (Chromium) */
 	struct v4l2_m2m_dev *m2m_dev;
 	/* Serializes ioctls and both videobuf2 queues. */
 	struct mutex lock;
@@ -815,37 +736,67 @@ struct histb_vdec_capture_mem {
 	bool cpu_synced;
 };
 
-/* Cacheable, physically contiguous capture surfaces have a private CMA pool.
- * Reconstruction surfaces and display scanout retain their existing pools.
- * DMA ownership transfers remain explicit; exporting a surface never copies it.
+/*
+ * Cacheable capture buffers.
+ *
+ * The queue used to hand NV12 output to userspace from
+ * dma_alloc_coherent(), which on arm64 with DMA_DIRECT_REMAP is uncached
+ * memory.  Every consumer read of a decoded frame then went straight to
+ * LPDDR: ffmpeg's av_frame_copy() alone accounted for 78% of the CPU time in
+ * a 1080p decode, and the hardware path ended up slower than the software
+ * one, which writes into ordinary cached memory.
+ *
+ * These buffers are allocated with dma_alloc_noncoherent() instead, the same
+ * primitive the reconstruction surfaces already use: physically contiguous
+ * (VPSS writes by DMA address, and the SMMU is configured as an identity
+ * mapping, so contiguity is required) but cacheable, with the cache
+ * maintained explicitly around the handover.
  */
 struct histb_vdec_cached_buf {
 	struct device *dev;
-	void *cpu;
+	void *cpu;		/* cacheable kernel mapping, made on first use (highmem: vmap) */
+	struct mutex map_lock;	/* serialises the lazy mapping */
+	struct page *page;	/* first page of the contiguous block */
 	dma_addr_t dma;
 	size_t size;
-	refcount_t refs;
+	refcount_t refs;	/* vb2 + dma_buf export + each userspace mapping */
 	struct vb2_vmarea_handler handler;
 };
+
+/*
+ * 1 (default): CAPTURE buffers are cacheable, cache maintained explicitly.
+ * 0: the old behaviour, vb2_dma_contig_memops (dma_alloc_coherent, uncached).
+ * Read when a buffer is allocated, so flip it before REQBUFS.
+ */
+static bool capture_cached = true;
+module_param(capture_cached, bool, 0644);
+MODULE_PARM_DESC(capture_cached,
+		 "CAPTURE buffers cacheable with explicit cache maintenance (default) or coherent/uncached (0)");
 
 static void histb_vdec_cached_put(void *buf_priv);
 
 static void *histb_vdec_cached_alloc(struct vb2_buffer *vb,
 				     struct device *dev, unsigned long size)
 {
-	struct histb_vdec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct histb_vdec_cached_buf *buf;
 
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return ERR_PTR(-ENOMEM);
 
-	buf->dev = get_device(ctx->vdec->capture_dev);
-	buf->size = PAGE_ALIGN(size);
-	buf->cpu = dma_alloc_noncoherent(buf->dev, buf->size, &buf->dma,
-					DMA_BIDIRECTIONAL, GFP_KERNEL);
-	if (!buf->cpu) {
-		put_device(buf->dev);
+	buf->dev = dev;
+	buf->size = size;
+	/*
+	 * No kernel mapping here.  A 4K NV12 buffer is 12.4 MB and the 32-bit
+	 * vmalloc window is 240 MB, so mapping every capture buffer (a dozen of
+	 * them) exhausted it before the decoder's own surfaces were allocated.
+	 * The hardware path never reads the buffer with the CPU; vaddr maps it
+	 * on first request.
+	 */
+	mutex_init(&buf->map_lock);
+	buf->page = histb_dma_alloc_block(dev, size, &buf->dma,
+					  DMA_BIDIRECTIONAL, GFP_KERNEL);
+	if (!buf->page) {
 		kfree(buf);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -857,37 +808,44 @@ static void *histb_vdec_cached_alloc(struct vb2_buffer *vb,
 	return buf;
 }
 
-static void histb_vdec_cached_free(struct histb_vdec_cached_buf *buf)
-{
-	dma_free_noncoherent(buf->dev, buf->size, buf->cpu, buf->dma,
-			     DMA_BIDIRECTIONAL);
-	put_device(buf->dev);
-	kfree(buf);
-}
-
 static void histb_vdec_cached_put(void *buf_priv)
 {
 	struct histb_vdec_cached_buf *buf = buf_priv;
 
-	if (!buf)
-		return;
-	if (!refcount_dec_and_test(&buf->refs))
+	if (!buf || !refcount_dec_and_test(&buf->refs))
 		return;
 
-	histb_vdec_cached_free(buf);
+	histb_dma_unmap_block(buf->cpu);
+	histb_dma_free_block(buf->dev, buf->size, buf->page, buf->dma);
+	kfree(buf);
 }
 
 static unsigned int histb_vdec_cached_num_users(void *buf_priv)
 {
-	return buf_priv ? refcount_read(&((struct histb_vdec_cached_buf *)buf_priv)->refs) : 0;
+	return buf_priv ?
+	       refcount_read(&((struct histb_vdec_cached_buf *)buf_priv)->refs) : 0;
 }
 
 static void *histb_vdec_cached_vaddr(struct vb2_buffer *vb, void *buf_priv)
 {
-	return buf_priv ? ((struct histb_vdec_cached_buf *)buf_priv)->cpu : NULL;
+	struct histb_vdec_cached_buf *buf = buf_priv;
+
+	if (!buf)
+		return NULL;
+	mutex_lock(&buf->map_lock);
+	if (!buf->cpu)
+		buf->cpu = histb_dma_map_block(buf->page, buf->size);
+	mutex_unlock(&buf->map_lock);
+	return buf->cpu;
 }
 
-/* Called before the hardware is pointed at the buffer. */
+/*
+ * Called by vb2 at QBUF, before the hardware is pointed at the buffer.
+ * Clean AND invalidate: a dirty line left in the cache would be evicted over
+ * the VPSS output later, and a clean line fetched speculatively earlier would
+ * hide it.  The CPU never writes these buffers in the hardware path, so this
+ * is normally a cheap invalidate of clean lines.
+ */
 static void histb_vdec_cached_prepare(void *buf_priv)
 {
 	struct histb_vdec_cached_buf *buf = buf_priv;
@@ -897,17 +855,60 @@ static void histb_vdec_cached_prepare(void *buf_priv)
 					   DMA_BIDIRECTIONAL);
 }
 
-/* Called before the CPU reads what the hardware wrote. */
+/*
+ * Called after the hardware wrote (DQBUF, or begin_cpu_access() right after the
+ * VPSS job): drop every line of the buffer so the CPU reads the DMA data.
+ */
 static void histb_vdec_cached_finish(void *buf_priv)
 {
 	struct histb_vdec_cached_buf *buf = buf_priv;
 
 	if (buf)
 		dma_sync_single_for_cpu(buf->dev, buf->dma, buf->size,
-					DMA_BIDIRECTIONAL);
+					DMA_FROM_DEVICE);
 }
 
-/* VPSS requires contiguous capture storage; exports share the same pages. */
+/*
+ * Userspace mapping.  dma_mmap_attrs() must NOT be used here: for a
+ * non-coherent device dma_pgprot() forces pgprot_dmacoherent() (uncached)
+ * whatever the attrs, even though the memory came from dma_alloc_pages().
+ * dma_mmap_pages() keeps vma->vm_page_prot, i.e. a cacheable mapping, which
+ * is what vb2_dma_contig does for its non-coherent buffers.  The vb2 vm_ops
+ * make every mapping hold a reference on the buffer.
+ */
+static int histb_vdec_cached_mmap(void *buf_priv, struct vm_area_struct *vma)
+{
+	struct histb_vdec_cached_buf *buf = buf_priv;
+	int ret;
+
+	if (!buf)
+		return -ENODEV;
+	ret = dma_mmap_pages(buf->dev, vma, buf->size, buf->page);
+	if (ret)
+		return ret;
+
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_private_data = &buf->handler;
+	vma->vm_ops = &vb2_common_vm_ops;
+	vma->vm_ops->open(vma);
+
+	return 0;
+}
+
+/*
+ * dma_buf export for the cacheable capture buffers.
+ *
+ * ffmpeg's v4l2request refuses a capture queue whose buffers cannot be
+ * exported, and vb2_dma_contig's exporter would need its own (uncached)
+ * allocation; vb2_dma_sg is not contiguous and VPSS walks the surface as
+ * base + offset.  Hence this small exporter.  The buffer is physically
+ * contiguous, so the sg table has a single entry with a real page.
+ *
+ * Cache rules (same as vb2_dc): map/unmap do not touch the cache
+ * (DMA_ATTR_SKIP_CPU_SYNC); the hardware side was handled by prepare() at
+ * QBUF and finish() at DQBUF, and a CPU user of the dma_buf brackets its
+ * access with DMA_BUF_IOCTL_SYNC, which lands in begin/end_cpu_access below.
+ */
 static struct sg_table *histb_vdec_cached_dmabuf_map(
 		struct dma_buf_attachment *attach,
 		enum dma_data_direction dir)
@@ -926,7 +927,7 @@ static struct sg_table *histb_vdec_cached_dmabuf_map(
 		return ERR_PTR(ret);
 	}
 
-	sg_set_page(sgt->sgl, virt_to_page(buf->cpu), buf->size, 0);
+	sg_set_page(sgt->sgl, buf->page, PAGE_ALIGN(buf->size), 0);
 	ret = dma_map_sgtable(attach->dev, sgt, dir, DMA_ATTR_SKIP_CPU_SYNC);
 	if (ret) {
 		sg_free_table(sgt);
@@ -946,23 +947,44 @@ static void histb_vdec_cached_dmabuf_unmap(struct dma_buf_attachment *attach,
 	kfree(sgt);
 }
 
-static int histb_vdec_cached_mmap(void *buf_priv, struct vm_area_struct *vma)
+static int histb_vdec_cached_dmabuf_begin_cpu_access(struct dma_buf *dbuf,
+						     enum dma_data_direction dir)
 {
-	struct histb_vdec_cached_buf *buf = buf_priv;
-	int ret;
+	struct histb_vdec_cached_buf *buf = dbuf->priv;
 
-	if (!buf)
-		return -ENODEV;
-	ret = dma_mmap_pages(buf->dev, vma, buf->size, virt_to_page(buf->cpu));
-	if (ret)
-		return ret;
-
-	/* A mapping can outlive both the video fd and the dma-buf fd. */
-	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_private_data = &buf->handler;
-	vma->vm_ops = &vb2_common_vm_ops;
-	vma->vm_ops->open(vma);
+	dma_sync_single_for_cpu(buf->dev, buf->dma, buf->size, dir);
 	return 0;
+}
+
+static int histb_vdec_cached_dmabuf_end_cpu_access(struct dma_buf *dbuf,
+						   enum dma_data_direction dir)
+{
+	struct histb_vdec_cached_buf *buf = dbuf->priv;
+
+	dma_sync_single_for_device(buf->dev, buf->dma, buf->size, dir);
+	return 0;
+}
+
+/* dma_buf_ops.vmap: iosys_map over the cacheable kernel mapping.  Required by
+ * consumers importing through drm_gem_dma_prime_import_sg_table_vmap() (the
+ * VDP display plane path) - without it that PRIME import fails with -EINVAL.
+ */
+static int histb_vdec_cached_dmabuf_vmap(struct dma_buf *dbuf,
+					 struct iosys_map *map)
+{
+	struct histb_vdec_cached_buf *buf = dbuf->priv;
+
+	if (!buf || !buf->cpu)
+		return -ENODEV;
+
+	iosys_map_set_vaddr(map, buf->cpu);
+
+	return 0;
+}
+
+static void histb_vdec_cached_dmabuf_vunmap(struct dma_buf *dbuf,
+					    struct iosys_map *map)
+{
 }
 
 static int histb_vdec_cached_dmabuf_mmap(struct dma_buf *dbuf,
@@ -971,35 +993,25 @@ static int histb_vdec_cached_dmabuf_mmap(struct dma_buf *dbuf,
 	return histb_vdec_cached_mmap(dbuf->priv, vma);
 }
 
-static int histb_vdec_cached_dmabuf_begin_cpu_access(struct dma_buf *dbuf,
-					 enum dma_data_direction dir)
-{
-	histb_vdec_cached_finish(dbuf->priv);
-	return 0;
-}
-
-static int histb_vdec_cached_dmabuf_end_cpu_access(struct dma_buf *dbuf,
-					 enum dma_data_direction dir)
-{
-	histb_vdec_cached_prepare(dbuf->priv);
-	return 0;
-}
-
 static void histb_vdec_cached_dmabuf_release(struct dma_buf *dbuf)
 {
-	struct histb_vdec_cached_buf *buf = dbuf->priv;
-
-	/* Drop the export reference; dma-buf core releases the dma_buf itself. */
-	if (refcount_dec_and_test(&buf->refs))
-		histb_vdec_cached_free(buf);
+	/*
+	 * dma_buf_release() frees the dma_buf itself, so only the reference
+	 * the export took is dropped here (a double free of the dma_buf once
+	 * ended in a refcount_t underflow in dma_resv_fini()).  If vb2 already
+	 * put its own, this is the last reference and the memory goes now.
+	 */
+	histb_vdec_cached_put(dbuf->priv);
 }
 
 static const struct dma_buf_ops histb_vdec_cached_dmabuf_ops = {
 	.map_dma_buf = histb_vdec_cached_dmabuf_map,
 	.unmap_dma_buf = histb_vdec_cached_dmabuf_unmap,
-	.mmap = histb_vdec_cached_dmabuf_mmap,
+	.vmap = histb_vdec_cached_dmabuf_vmap,
+	.vunmap = histb_vdec_cached_dmabuf_vunmap,
 	.begin_cpu_access = histb_vdec_cached_dmabuf_begin_cpu_access,
 	.end_cpu_access = histb_vdec_cached_dmabuf_end_cpu_access,
+	.mmap = histb_vdec_cached_dmabuf_mmap,
 	.release = histb_vdec_cached_dmabuf_release,
 };
 
@@ -1040,7 +1052,7 @@ histb_vdec_capture_backend(const struct vb2_buffer *vb)
 {
 	struct histb_vdec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 
-	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
+	if (capture_cached && V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
 	    vb->vb2_queue->memory == VB2_MEMORY_MMAP)
 		return &histb_vdec_cached_memops;
 
@@ -1083,7 +1095,12 @@ histb_vdec_capture_get_dmabuf(struct vb2_buffer *vb, void *buf_priv,
 {
 	struct histb_vdec_capture_mem *mem = buf_priv;
 
-	/* Backends without export support must fail EXPBUF cleanly. */
+	/*
+	 * Not every backend exports a dma_buf - vb2_vmalloc_memops and the
+	 * cacheable backend below do not - so this cannot be forwarded
+	 * unconditionally.  Calling through a NULL function pointer is an
+	 * immediate oops; returning an error lets the caller fall back.
+	 */
 	if (!mem->ops->get_dmabuf)
 		return ERR_PTR(-EOPNOTSUPP);
 
@@ -1137,10 +1154,8 @@ static void *histb_vdec_capture_attach_dmabuf(struct vb2_buffer *vb,
 	if (!mem)
 		return ERR_PTR(-ENOMEM);
 	mem->ops = histb_vdec_capture_backend(vb);
-	if (!mem->ops->attach_dmabuf) {
-		kfree(mem);
+	if (!mem->ops->attach_dmabuf)
 		return ERR_PTR(-ENODEV);
-	}
 	mem->priv = mem->ops->attach_dmabuf(vb, dev, dbuf, size);
 	if (IS_ERR(mem->priv)) {
 		void *ret = mem->priv;
@@ -1215,6 +1230,8 @@ static int histb_vdec_capture_mmap(void *buf_priv, struct vm_area_struct *vma)
 	return mem->ops->mmap(mem->priv, vma);
 }
 
+static int histb_vdec_capture_begin_cpu_access(struct vb2_buffer *vb);
+
 static const struct vb2_mem_ops histb_vdec_capture_memops = {
 	.alloc = histb_vdec_capture_alloc,
 	.put = histb_vdec_capture_put,
@@ -1231,43 +1248,6 @@ static const struct vb2_mem_ops histb_vdec_capture_memops = {
 	.mmap = histb_vdec_capture_mmap,
 };
 
-static const u32 histb_vdec_cv200_formats[] = {
-	V4L2_PIX_FMT_H264_SLICE, V4L2_PIX_FMT_HEVC_SLICE,
-	V4L2_PIX_FMT_MPEG2_SLICE, V4L2_PIX_FMT_MPEG4,
-	V4L2_PIX_FMT_VP8_FRAME, V4L2_PIX_FMT_VP9_FRAME,
-	V4L2_PIX_FMT_VC1_ANNEX_G, V4L2_PIX_FMT_VC1_ANNEX_L,
-	V4L2_PIX_FMT_AVS_SLICE,
-};
-
-static const u32 histb_vdec_mv310_formats[] = {
-	V4L2_PIX_FMT_H264_SLICE, V4L2_PIX_FMT_HEVC_SLICE,
-	V4L2_PIX_FMT_MPEG2_SLICE, V4L2_PIX_FMT_MPEG4,
-	V4L2_PIX_FMT_VC1_ANNEX_G, V4L2_PIX_FMT_VC1_ANNEX_L,
-	V4L2_PIX_FMT_AVS_SLICE, V4L2_PIX_FMT_AVS2, V4L2_PIX_FMT_MPEG1,
-};
-static size_t histb_vdec_cv200_stream_guard(u32 pixelformat)
-{
-	(void)pixelformat;
-	return HISTB_VDEC_RAW_STREAM_GUARD;
-}
-
-static size_t histb_vdec_mv310_stream_guard(u32 pixelformat)
-{
-	return pixelformat == V4L2_PIX_FMT_AVS_SLICE ? SZ_4K :
-		HISTB_VDEC_RAW_STREAM_GUARD;
-}
-
-static bool histb_vdec_backend_supports_format(
-		const struct histb_vdec_backend *backend, u32 pixelformat)
-{
-	unsigned int i;
-
-	for (i = 0; i < backend->num_formats; i++)
-		if (backend->formats[i] == pixelformat)
-			return true;
-	return false;
-}
-
 static bool histb_vdec_is_vc1_format(u32 pixelformat)
 {
 	return pixelformat == V4L2_PIX_FMT_VC1_ANNEX_G ||
@@ -1282,7 +1262,6 @@ static bool histb_vdec_is_stateless_format(u32 pixelformat)
 	case V4L2_PIX_FMT_MPEG2_SLICE:
 	case V4L2_PIX_FMT_VP8_FRAME:
 	case V4L2_PIX_FMT_VP9_FRAME:
-	case V4L2_PIX_FMT_AVS_SLICE:
 		return true;
 	default:
 		return false;
@@ -1299,10 +1278,9 @@ static u32 histb_vdec_tile_stride(u32 width)
 	return (blocks + (blocks & 1 ? 2 : 1)) * 256;
 }
 
-static u32 histb_vdec_cv200_surface_stride(struct histb_vdec_ctx *ctx)
+static u32 histb_vdec_surface_stride(struct histb_vdec_ctx *ctx)
 {
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 ||
 	    histb_vdec_is_vc1_format(ctx->src.pix.pixelformat) ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_VP9_FRAME)
@@ -1311,12 +1289,7 @@ static u32 histb_vdec_cv200_surface_stride(struct histb_vdec_ctx *ctx)
 	return histb_vdec_tile_stride(ctx->src.pix.width);
 }
 
-static u32 histb_vdec_mv310_surface_stride(struct histb_vdec_ctx *ctx)
-{
-	return ALIGN(ctx->src.pix.width, 256);
-}
-
-static u32 histb_vdec_cv200_surface_height_align(struct histb_vdec_ctx *ctx)
+static u32 histb_vdec_surface_height_align(struct histb_vdec_ctx *ctx)
 {
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE &&
 	    ctx->mpeg2_field_picture)
@@ -1324,34 +1297,11 @@ static u32 histb_vdec_cv200_surface_height_align(struct histb_vdec_ctx *ctx)
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_VP9_FRAME)
 		return 64;
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE ||
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 ||
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 ||
 	    histb_vdec_is_vc1_format(ctx->src.pix.pixelformat))
 		return 32;
 
 	return 16;
-}
-
-static u32 histb_vdec_mv310_surface_height_align(struct histb_vdec_ctx *ctx)
-{
-	return (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
-		ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) ? 64 : 32;
-}
-
-static u32 histb_vdec_surface_stride(struct histb_vdec_ctx *ctx)
-{
-	return ctx->vdec->backend->surface_stride(ctx);
-}
-
-static u32 histb_vdec_surface_height_align(struct histb_vdec_ctx *ctx)
-{
-	return ctx->vdec->backend->surface_height_align(ctx);
-}
-
-static u32 histb_vdec_avs_height_mbs(u16 height, bool progressive)
-{
-	return progressive ? DIV_ROUND_UP(height, 16) :
-		2 * DIV_ROUND_UP(height, 32);
 }
 
 static size_t histb_vdec_ebsp_to_rbsp(u8 *data, size_t size)
@@ -1378,88 +1328,63 @@ static size_t histb_vdec_ebsp_to_rbsp(u8 *data, size_t size)
 	return write;
 }
 
-
-
-static bool histb_vdec_mvc_busy(struct histb_vdec_ctx *ctx, void *buffer)
+static bool histb_vdec_is_epb(const u8 *data, size_t size, size_t i,
+			      unsigned int zeroes)
 {
-	bool busy;
-
-	if (!ctx->mvc_ingress.subset.is_valid)
-		return false;
-	mutex_lock(&ctx->mvc_lock);
-	busy = histb_mvc_ingress_busy(&ctx->mvc_ingress, buffer);
-	mutex_unlock(&ctx->mvc_lock);
-	return busy;
+	return zeroes == 2 && data[i] == 3 && i + 1 < size && data[i + 1] <= 3;
 }
 
-static void histb_vdec_mvc_reap(struct histb_vdec_ctx *ctx)
+/* Count 00 00 03 sequences and the RBSP 00 00 0x patterns they protect. */
+static void histb_vdec_count_epb(const u8 *data, size_t size, u32 *epb,
+				 u32 *hazards)
 {
-	unsigned int i;
+	unsigned int zeroes = 0;
+	size_t i;
 
-	if (!ctx->mvc_ingress.subset.is_valid)
-		return;
-	mutex_lock(&ctx->mvc_lock);
-	for (i = 0; i < ARRAY_SIZE(ctx->mvc_ingress.surface); i++) {
-		struct histb_vdec_decoded_buffer *decoded =
-			ctx->mvc_ingress.surface[i].buffer;
-
-		if (!decoded || histb_mvc_ingress_busy(&ctx->mvc_ingress, decoded))
+	*epb = 0;
+	*hazards = 0;
+	for (i = 0; i < size; i++) {
+		if (histb_vdec_is_epb(data, size, i, zeroes)) {
+			(*epb)++;
+			(*hazards)++;
+			zeroes = 0;
 			continue;
-		if (decoded->apc_slot >= 0 &&
-		    ctx->apc[decoded->apc_slot] == decoded)
-			ctx->apc[decoded->apc_slot] = NULL;
-		decoded->apc_slot = HISTB_VDEC_APC_INVALID;
-		histb_mvc_ingress_retire(&ctx->mvc_ingress, decoded);
+		}
+		zeroes = data[i] ? 0 : min(zeroes + 1, 2U);
 	}
-	mutex_unlock(&ctx->mvc_lock);
 }
 
-static int histb_vdec_h264_packet(struct histb_vdec_ctx *ctx,
-		struct vb2_v4l2_buffer *src, unsigned long *payload,
-		u32 *offset, struct histb_mvc_slice_identity *identity)
+/*
+ * Map a bit position in the RBSP (where the uAPI's header_bit_size lives) to
+ * the same bit in the EBSP.  EPBs are whole bytes, so the bit-in-byte is kept
+ * and only the byte index moves.  Returns false if the position is past the
+ * end of the NAL.
+ */
+static bool histb_vdec_rbsp_to_ebsp_bits(const u8 *data, size_t size,
+					 u64 rbsp_bits, u64 *ebsp_bits)
 {
-	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
-	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(&ctx->ctrl_handler,
-					 V4L2_CID_STATELESS_H264_START_CODE);
-	bool annex_b = ctrl && ctrl->val == V4L2_STATELESS_H264_START_CODE_ANNEX_B;
-	u32 needed, length;
-	int ret;
+	u64 target = rbsp_bits / 8, rbsp_byte = 0;
+	unsigned int zeroes = 0;
+	size_t i;
 
-	if (!data || *payload > U32_MAX)
-		return -EINVAL;
-	data += src->vb2_buf.planes[0].data_offset;
-	if (!annex_b && !ctx->mvc_ingress.subset.is_valid &&
-	    *payload && (data[0] & 31) != HISTB_MVC_NAL_TYPE_SLICEEXT) {
-		*offset = 0;
-		return 0;
+	for (i = 0; i < size; i++) {
+		if (histb_vdec_is_epb(data, size, i, zeroes)) {
+			zeroes = 0;
+			continue;
+		}
+		if (rbsp_byte == target) {
+			*ebsp_bits = (u64)i * 8 + rbsp_bits % 8;
+			return true;
+		}
+		rbsp_byte++;
+		zeroes = data[i] ? 0 : min(zeroes + 1, 2U);
 	}
-	needed = histb_mvc_ingress_scratch_size(data, *payload, annex_b);
-	if (needed > HISTB_MVC_MAX_BYTES_START)
-		return -E2BIG;
-	if (needed > ctx->mvc_rbsp_size) {
-		u8 *scratch = kvmalloc(needed, GFP_KERNEL);
-
-		if (!scratch)
-			return -ENOMEM;
-		kvfree(ctx->mvc_rbsp);
-		ctx->mvc_rbsp = scratch;
-		ctx->mvc_rbsp_size = needed;
-	}
-	mutex_lock(&ctx->mvc_lock);
-	ret = histb_mvc_ingress_packet(&ctx->mvc_ingress, data, *payload,
-		annex_b, ctx->mvc_rbsp, ctx->mvc_rbsp_size, offset, &length, identity);
-	if (!ret && ctx->mvc_ingress.subset.is_valid &&
-	    !(ctx->vdec->backend->caps & HISTB_VDEC_BACKEND_MVC))
-		ret = -EOPNOTSUPP;
-	mutex_unlock(&ctx->mvc_lock);
-	if (!ret)
-		*payload = length;
-	return ret;
+	return false;
 }
 
 static int histb_vdec_append_h264_bitstream(struct histb_vdec_ctx *ctx,
 					     struct vb2_v4l2_buffer *src,
-					     u32 source_offset,
+					     size_t src_off,
 					     unsigned long *payload,
 					     dma_addr_t *slice_dma,
 					     u32 *tail_bits)
@@ -1470,11 +1395,11 @@ static int histb_vdec_append_h264_bitstream(struct histb_vdec_ctx *ctx,
 	size_t ebsp_size = *payload;
 	size_t allocation, data_end, offset, required, tail_bytes;
 	u8 *src_cpu;
+	bool raw;
 
 	offset = ALIGN(ctx->h264_stream_bytes, 16);
 	if (check_add_overflow(offset, ebsp_size, &data_end) ||
-	    check_add_overflow(data_end,
-			       ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat),
+	    check_add_overflow(data_end, HISTB_VDEC_RAW_STREAM_GUARD,
 			       &required) ||
 	    required > HISTB_VDEC_MAX_BITSTREAM)
 		return -E2BIG;
@@ -1503,12 +1428,39 @@ static int histb_vdec_append_h264_bitstream(struct histb_vdec_ctx *ctx,
 	src_cpu = vb2_plane_vaddr(&src->vb2_buf, 0);
 	if (!src_cpu)
 		return -EOPNOTSUPP;
-	src_cpu += src->vb2_buf.planes[0].data_offset + source_offset;
+	src_cpu += src->vb2_buf.planes[0].data_offset + src_off;
 	memset(stream->cpu + ctx->h264_stream_bytes, 0,
 	       offset - ctx->h264_stream_bytes);
+	/* One feed mode per picture: every slice of it shares one stream. */
+	if (!ctx->h264_slices)
+		ctx->h264_raw = READ_ONCE(h264_raw_ebsp);
+	raw = ctx->h264_raw;
+	if (ctx->h264_slices < HISTB_VDEC_H264_DIAG_SLICES) {
+		struct histb_vdec_h264_diag *diag =
+			&ctx->h264_diag[ctx->h264_slices];
+
+		/* Count on the vb2 mapping, not on the uncached stream copy. */
+		histb_vdec_count_epb(src_cpu, ebsp_size, &diag->epb,
+				     &diag->rbsp_hazards);
+		diag->ebsp_bytes = ebsp_size;
+		diag->raw = raw;
+	}
 	memcpy(stream->cpu + offset, src_cpu, ebsp_size);
-	*payload = histb_vdec_ebsp_to_rbsp(stream->cpu + offset, ebsp_size);
-	/* Keep speculative VDH fetches inside zero-filled stream storage. */
+	if (raw)
+		*payload = ebsp_size;
+	else
+		*payload = histb_vdec_ebsp_to_rbsp(stream->cpu + offset,
+						   ebsp_size);
+	/*
+	 * VDH fetches full bus bursts around the valid stream-bit boundary, and
+	 * the backwards scan below needs a zero byte to stop at.  Both needs
+	 * are served by a short tail; zeroing the whole remaining allocation
+	 * instead costs one uncached pass over `stream->size - offset -
+	 * *payload` bytes per frame, and stream->size only ever grows, so a
+	 * single large IDR makes every later frame clear megabytes of uncached
+	 * memory.  bitstream_tail_trim selects the short tail for A/B
+	 * measurement.
+	 */
 	memset(stream->cpu + offset + *payload, 0,
 	       stream->size - offset - *payload);
 	tail_bytes = *payload;
@@ -1578,15 +1530,6 @@ static int histb_vdec_run_vc1_bpd(struct histb_vdec_ctx *ctx,
 				  struct histb_vc1_bpd_result *result);
 static int histb_vdec_resize_vc1_stream(struct histb_vdec_ctx *ctx,
 					 size_t required);
-static int histb_vdec_load_avsp(struct histb_vdec_dev *vdec);
-static int
-histb_vdec_validate_avs(struct histb_vdec_ctx *ctx,
-			const struct v4l2_ctrl_avs_sequence *sequence,
-			const struct v4l2_ctrl_avs_picture *picture,
-			const struct v4l2_ctrl_avs_slice_params *slices,
-			unsigned int num_slices,
-			const struct v4l2_ctrl_avs_decode_params *decode,
-			const u8 *payload_data, unsigned long payload);
 
 struct histb_vdec_mpeg2_vlc {
 	u16 code;
@@ -1681,7 +1624,7 @@ static int histb_vdec_vp9_read_color_config(struct histb_vdec_bitreader *br,
 	u32 color_space;
 	bool full_range;
 
-	/* The hardware message path supports profile-0 8-bit 4:2:0. */
+	/* The first candidate accepts only profile-0 8-bit 4:2:0. */
 	if (profile)
 		return -EINVAL;
 	if (histb_vdec_read_bits(br, 3, &color_space))
@@ -2166,7 +2109,7 @@ static void histb_vdec_vp9_loop_filter_levels(
 
 static u32 histb_vdec_vp9_scale_fp(u32 ref, u32 current_size)
 {
-	return ((u64)ref << 14) / current_size;
+	return div_u64((u64)ref << 14, current_size);
 }
 
 static int histb_vdec_prepare_vp9_tiles(struct histb_vdec_ctx *ctx,
@@ -2338,7 +2281,7 @@ static int histb_vdec_prepare_vp9_messages(
 		histb_vdec_vp9_signed_magnitude(frame->quant.delta_q_uv_dc, 5) << 16 |
 		histb_vdec_vp9_signed_magnitude(frame->quant.delta_q_uv_ac, 5) << 24);
 	pic[21] = cpu_to_le32(
-		!!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED) |
+		(!!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED)) |
 		!!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP) << 1 |
 		!!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ABS_OR_DELTA_UPDATE) << 2 |
 		!!(frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_TEMPORAL_UPDATE) << 3);
@@ -2462,7 +2405,7 @@ static int histb_vdec_copy_raw_bitstream(struct histb_vdec_ctx *ctx,
 	u8 *src_cpu;
 
 	if (check_add_overflow((size_t)payload,
-			       ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat), &required) ||
+			       (size_t)HISTB_VDEC_RAW_STREAM_GUARD, &required) ||
 	    required > SIZE_MAX - (SZ_64K - 1))
 		return -EOVERFLOW;
 	allocation = ALIGN(required, SZ_64K);
@@ -2563,8 +2506,8 @@ static int histb_vdec_copy_hevc_bitstream(
 	unsigned int i;
 
 	if (check_add_overflow((size_t)payload,
-			       ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat), &required) ||
-		    required > HISTB_VDEC_MAX_BITSTREAM)
+			       (size_t)HISTB_VDEC_RAW_STREAM_GUARD, &required) ||
+	    required > HISTB_VDEC_MAX_BITSTREAM)
 		return -E2BIG;
 	allocation = ALIGN(required, SZ_64K);
 	if (stream->size < allocation) {
@@ -2608,7 +2551,7 @@ static int histb_vdec_copy_hevc_bitstream(
 		u64 skipped_bits;
 
 		if (!nal_size || nal_size > payload - src_offset ||
-			slice->data_byte_offset >= nal_size)
+		    slice->data_byte_offset >= nal_size)
 			return -EINVAL;
 		memcpy(ctx->hevc_stream_shadow + dst_offset,
 		       src_cpu + src_offset, nal_size);
@@ -2626,9 +2569,12 @@ static int histb_vdec_copy_hevc_bitstream(
 	if (src_offset != payload)
 		return -EINVAL;
 	memcpy(stream->cpu, ctx->hevc_stream_shadow, dst_offset);
-	/* Pad the final DMA burst beyond the valid stream bits. */
-	memset(stream->cpu + dst_offset, 0,
-	       ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat));
+	/* VDH may fetch one final bus burst past valid_bits, but it cannot
+	 * consume data beyond that boundary.  Clearing the whole allocation
+	 * made every request write up to 8 MiB of uncached coherent memory after
+	 * a single large access unit had grown the buffer. */
+	memset(stream->cpu + dst_offset, 0, HISTB_VDEC_RAW_STREAM_GUARD);
+	*stream_dma = stream->dma;
 
 	return 0;
 }
@@ -2650,16 +2596,15 @@ static size_t histb_vdec_tile_size(struct histb_vdec_ctx *ctx)
 			       histb_vdec_surface_height_align(ctx));
 	size = stride * height * 3 / 2;
 
-	/* Main10 stores high-eight-bit planes followed by packed two-bit planes. */
-	if ((ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
-	     ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) && ctx->hevc_main10)
+	/* CV200 stores Main10 as an 8-bit tile plane followed by packed low bits. */
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
+	    ctx->hevc_main10)
 		size += (stride / 4) * height * 3 / 2;
 
-	/* Backend-owned surface tail guard follows the native allocator contract. */
-	return size + ctx->vdec->backend->surface_tail_guard;
+	return size;
 }
 
-static size_t histb_vdec_cv200_pmv_size(struct histb_vdec_ctx *ctx)
+static size_t histb_vdec_pmv_size(struct histb_vdec_ctx *ctx)
 {
 	u32 width_mbs = DIV_ROUND_UP(ctx->src.pix.width, 16);
 	u32 height_mbs;
@@ -2667,38 +2612,18 @@ static size_t histb_vdec_cv200_pmv_size(struct histb_vdec_ctx *ctx)
 
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
 		height_mbs = 2 * DIV_ROUND_UP(ctx->src.pix.height, 32);
-	else if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE)
-		height_mbs = histb_vdec_avs_height_mbs(ctx->src.pix.height, false);
 	else
 		height_mbs = DIV_ROUND_UP(ctx->src.pix.height, 16);
 
 	/* VP9 uses the single context-level work slot allocated with the codec. */
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_VP9_FRAME)
 		return 0;
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE)
+	else if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE)
 		size = width_mbs * height_mbs * 64 + 16;
 	else
 		size = width_mbs * height_mbs * 64;
 
 	return ALIGN(size, 128);
-}
-
-static size_t histb_vdec_mv310_pmv_size(struct histb_vdec_ctx *ctx)
-{
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE) {
-		u32 ctb_size = BIT(max_t(u8, ctx->hevc_ctb_log2, 4));
-		u32 width_mbs = ALIGN(ctx->src.pix.width, ctb_size) / 16;
-		u32 height_mbs = ALIGN(ctx->src.pix.height, ctb_size) / 16;
-
-		/* Native hevc_init_dpb passes CTU-padded dimensions to FSP. */
-		return ALIGN(width_mbs * height_mbs * 16 + 384, 128);
-	}
-	return histb_vdec_cv200_pmv_size(ctx);
-}
-
-static size_t histb_vdec_pmv_size(struct histb_vdec_ctx *ctx)
-{
-	return ctx->vdec->backend->pmv_size(ctx);
 }
 
 static int histb_vdec_set_decoded_buffer_sizes(
@@ -2708,7 +2633,16 @@ static int histb_vdec_set_decoded_buffer_sizes(
 	size_t tile_size = histb_vdec_tile_size(ctx);
 	size_t pmv_size = histb_vdec_pmv_size(ctx);
 
-	/* Live reference surfaces retain their allocated geometry until S_FMT. */
+	/*
+	 * The surface geometry is fixed for the lifetime of a setup: it is
+	 * derived from the coded format and a per-stream flag such as
+	 * mpeg2_field_picture.  HEVC renegotiates the capture format on
+	 * every job, so releasing the surfaces here made the decoder
+	 * pipeline fail to reset on each frame (-110, ETIMEDOUT) and the
+	 * stream fell back to ~0.5x realtime.  Keep rejecting a geometry
+	 * change instead: it means the capture format moved underneath a
+	 * running setup, which the client must resolve with S_FMT.
+	 */
 	if ((decoded->tile.cpu && decoded->tile.size != tile_size) ||
 	    (decoded->pmv.cpu && decoded->pmv.size != pmv_size)) {
 		dev_err_ratelimited(ctx->vdec->dev,
@@ -2723,55 +2657,39 @@ static int histb_vdec_set_decoded_buffer_sizes(
 	return 0;
 }
 
-static void histb_vdec_free_dma_buffer(struct device *dev,
-				      struct histb_vdec_dma_buffer *buffer,
-				      bool noncoherent)
-{
-	if (!buffer->cpu)
-		return;
-	if (noncoherent)
-		dma_free_noncoherent(dev, buffer->size, buffer->cpu, buffer->dma,
-				     DMA_BIDIRECTIONAL);
-	else
-		dma_free_coherent(dev, buffer->size, buffer->cpu, buffer->dma);
-	buffer->cpu = NULL;
-	buffer->dma = 0;
-}
-
-static int histb_vdec_alloc_mvc_pmv(struct histb_vdec_ctx *ctx, size_t size)
-{
-	struct histb_vdec_dma_buffer *pmv = &ctx->mvc_pmv;
-	struct device *dev = ctx->vdec->dev;
-
-	if (pmv->cpu && pmv->size == size)
-		return 0;
-	histb_vdec_free_dma_buffer(dev, pmv, false);
-	pmv->size = size;
-	pmv->cpu = dma_alloc_coherent(dev, pmv->size, &pmv->dma, GFP_KERNEL);
-	if (!pmv->cpu)
-		return -ENOMEM;
-	if (upper_32_bits(pmv->dma)) {
-		histb_vdec_free_dma_buffer(dev, pmv, false);
-		return -ERANGE;
-	}
-	/* ION supplies zeroed PMV backing in the selected native firmware.
-	 * The interview slot is read-only, never a temporal decode destination.
-	 */
-	memset(pmv->cpu, 0, pmv->size);
-	return 0;
-}
-
 static void
 histb_vdec_free_decoded_buffers(struct histb_vdec_ctx *ctx,
 				struct histb_vdec_decoded_buffer *decoded)
 {
 	struct device *dev = ctx->vdec->dev;
 
-	histb_vdec_free_dma_buffer(dev, &decoded->pmv, decoded->pmv_noncoherent);
-	histb_vdec_free_dma_buffer(dev, &decoded->tile, decoded->tile_noncoherent);
+	if (decoded->pmv.cpu) {
+		if (decoded->pmv_noncoherent)
+			histb_dma_free_noncoherent(dev, decoded->pmv.size,
+					     decoded->pmv.cpu,
+					     decoded->pmv.dma,
+					     DMA_BIDIRECTIONAL);
+		else
+			dma_free_coherent(dev, decoded->pmv.size,
+					  decoded->pmv.cpu, decoded->pmv.dma);
+	}
+	if (decoded->tile.cpu) {
+		if (decoded->tile_noncoherent)
+			histb_dma_free_noncoherent(dev, decoded->tile.size,
+					     decoded->tile.cpu,
+					     decoded->tile.dma,
+					     DMA_BIDIRECTIONAL);
+		else
+			dma_free_coherent(dev, decoded->tile.size,
+					  decoded->tile.cpu,
+					  decoded->tile.dma);
+	}
+	decoded->pmv.cpu = NULL;
+	decoded->pmv.dma = 0;
+	decoded->tile.cpu = NULL;
+	decoded->tile.dma = 0;
 	decoded->tile_noncoherent = true;
 	decoded->pmv_noncoherent = true;
-	memset(&decoded->avs, 0, sizeof(decoded->avs));
 	decoded->vp9_dpb_valid = false;
 	decoded->vp9_logic_id = HISTB_VDEC_APC_INVALID;
 }
@@ -2781,29 +2699,26 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 				 struct histb_vdec_decoded_buffer *decoded)
 {
 	struct device *dev = ctx->vdec->dev;
-	bool reserved_pool = false;
-	bool hevc_vpss_surface;
-
-#ifdef CONFIG_DMA_DECLARE_COHERENT
-	reserved_pool = dev->dma_mem != NULL;
-#endif
-	hevc_vpss_surface = reserved_pool &&
-		ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
-		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12;
 	if (decoded->tile.cpu && (!decoded->pmv.size || decoded->pmv.cpu))
 		return 0;
 	if (decoded->tile.cpu || decoded->pmv.cpu)
 		histb_vdec_free_decoded_buffers(ctx, decoded);
 
-	/* VPSS consumes native and downscaled NV12 reconstruction surfaces by
-	 * DMA. Keep their coded-size storage in the reserved VDH pool rather
-	 * than competing with capture buffers for CMA. P010 CPU postprocessing
-	 * retains cacheable storage for UHD surfaces.
+	/*
+	 * Cacheable surfaces at every size outside field-rate DEI. This used to
+	 * switch to
+	 * dma_alloc_coherent() at 3840 and above, i.e. the 4K decode output
+	 * (~12 MB per frame) was mapped uncached while every smaller size was
+	 * cacheable.  The explicit dma_sync_single_for_device() below covers
+	 * the device view, so the coherent allocation buys nothing and costs a
+	 * large multiple of the decode time - measured 6 fps for 4K HEVC
+	 * Main10 against a 50 fps stream.
 	 */
-	decoded->tile_noncoherent = !hevc_vpss_surface &&
-		(ctx->src.pix.width > 1920 || ctx->src.pix.height > 1088);
+	/* FHD device-only reconstruction uses the dedicated VDEC pool. */
+	decoded->tile_noncoherent = ctx->src.pix.width > 1920 ||
+				    ctx->src.pix.height > 1088;
 	if (decoded->tile_noncoherent)
-		decoded->tile.cpu = dma_alloc_noncoherent(dev, decoded->tile.size,
+		decoded->tile.cpu = histb_dma_alloc_noncoherent(dev, decoded->tile.size,
 							  &decoded->tile.dma,
 							  DMA_BIDIRECTIONAL,
 							  GFP_KERNEL);
@@ -2815,7 +2730,7 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 	if (decoded->pmv.size) {
 		decoded->pmv_noncoherent = decoded->tile_noncoherent;
 		if (decoded->pmv_noncoherent)
-			decoded->pmv.cpu = dma_alloc_noncoherent(dev,
+			decoded->pmv.cpu = histb_dma_alloc_noncoherent(dev,
 								 decoded->pmv.size,
 								 &decoded->pmv.dma,
 								 DMA_BIDIRECTIONAL,
@@ -2856,10 +2771,13 @@ static void histb_vdec_free_mpeg4_anchor(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_mpeg4_anchor *anchor)
 {
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &anchor->pmv,
-				    anchor->tile_noncoherent);
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &anchor->tile,
-				    anchor->tile_noncoherent);
+	struct histb_vdec_decoded_buffer decoded = {
+		.tile = anchor->tile,
+		.pmv = anchor->pmv,
+		.tile_noncoherent = anchor->tile_noncoherent,
+	};
+
+	histb_vdec_free_decoded_buffers(ctx, &decoded);
 	memset(anchor, 0, sizeof(*anchor));
 }
 
@@ -2898,6 +2816,11 @@ static void histb_vdec_commit_mpeg4_state(struct histb_vdec_ctx *ctx)
 	struct histb_vdec_decoded_buffer *decoded = ctx->mpeg4_pending_output;
 	struct histb_vdec_mpeg4_anchor *earlier = &ctx->mpeg4_ref[0];
 	struct histb_vdec_mpeg4_anchor *latest = &ctx->mpeg4_ref[1];
+	struct histb_vdec_decoded_buffer old_latest = {
+		.tile = latest->tile,
+		.pmv = latest->pmv,
+		.tile_noncoherent = latest->tile_noncoherent,
+	};
 
 	if (!ctx->mpeg4_pending_valid || !decoded)
 		return;
@@ -2908,10 +2831,13 @@ static void histb_vdec_commit_mpeg4_state(struct histb_vdec_ctx *ctx)
 	}
 
 	histb_vdec_free_mpeg4_anchor(ctx, earlier);
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &latest->pmv,
-				    latest->tile_noncoherent);
-	earlier->tile = latest->tile;
-	earlier->tile_noncoherent = latest->tile_noncoherent;
+	if (old_latest.pmv.cpu) {
+		dma_free_coherent(ctx->vdec->dev, old_latest.pmv.size,
+				  old_latest.pmv.cpu, old_latest.pmv.dma);
+		memset(&old_latest.pmv, 0, sizeof(old_latest.pmv));
+	}
+	earlier->tile = old_latest.tile;
+	earlier->tile_noncoherent = old_latest.tile_noncoherent;
 
 	memset(latest, 0, sizeof(*latest));
 	latest->tile = decoded->tile;
@@ -2929,8 +2855,8 @@ static void histb_vdec_sync_surface_for_device(
 		struct histb_vdec_ctx *ctx, struct histb_vdec_dma_buffer *surface,
 		bool noncoherent)
 {
-	/* A pipelined HEVC request may reuse a reference before VPSS returns
-	 * CPU ownership; still publish the completed device writes. */
+	if (!surface->cpu_owned)
+		return;
 	if (noncoherent)
 		dma_sync_single_for_device(ctx->vdec->dev, surface->dma,
 					   surface->size, DMA_BIDIRECTIONAL);
@@ -2949,10 +2875,13 @@ static void histb_vdec_free_vc1_anchor(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_vc1_anchor *anchor)
 {
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &anchor->pmv,
-				    anchor->tile_noncoherent);
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &anchor->tile,
-				    anchor->tile_noncoherent);
+	struct histb_vdec_decoded_buffer decoded = {
+		.tile = anchor->tile,
+		.pmv = anchor->pmv,
+		.tile_noncoherent = anchor->tile_noncoherent,
+	};
+
+	histb_vdec_free_decoded_buffers(ctx, &decoded);
 	memset(anchor, 0, sizeof(*anchor));
 }
 
@@ -2993,6 +2922,11 @@ static bool histb_vdec_commit_vc1_state(struct histb_vdec_ctx *ctx)
 	struct histb_vdec_vc1_anchor *latest = &ctx->vc1_ref[1];
 	bool field_pair, nonreference, recovery;
 	u8 old_ref_dist = latest->ref_dist;
+	struct histb_vdec_decoded_buffer old_latest = {
+		.tile = latest->tile,
+		.pmv = latest->pmv,
+		.tile_noncoherent = latest->tile_noncoherent,
+	};
 
 	if (!ctx->vc1_pending_valid || !decoded)
 		return false;
@@ -3035,10 +2969,13 @@ static bool histb_vdec_commit_vc1_state(struct histb_vdec_ctx *ctx)
 	 * two PMV allocations.  Ownership changes only after hardware success.
 	 */
 	histb_vdec_free_vc1_anchor(ctx, earlier);
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &latest->pmv,
-				    latest->tile_noncoherent);
-	earlier->tile = latest->tile;
-	earlier->tile_noncoherent = latest->tile_noncoherent;
+	if (old_latest.pmv.cpu) {
+		dma_free_coherent(ctx->vdec->dev, old_latest.pmv.size,
+				  old_latest.pmv.cpu, old_latest.pmv.dma);
+		memset(&old_latest.pmv, 0, sizeof(old_latest.pmv));
+	}
+	earlier->tile = old_latest.tile;
+	earlier->tile_noncoherent = old_latest.tile_noncoherent;
 	earlier->intensity = ctx->vc1_pending_earlier_intensity;
 	earlier->halfpel = latest->halfpel;
 	earlier->range_reduction = latest->range_reduction;
@@ -3093,9 +3030,6 @@ static void histb_vdec_sync_vc1_anchor_for_device(
 {
 	histb_vdec_sync_surface_for_device(ctx, &anchor->tile,
 					    anchor->tile_noncoherent);
-	if (anchor->pmv.cpu)
-		histb_vdec_sync_surface_for_device(ctx, &anchor->pmv,
-						    anchor->tile_noncoherent);
 }
 
 static void histb_vdec_sync_tile_for_device(
@@ -3105,9 +3039,6 @@ static void histb_vdec_sync_tile_for_device(
 	if (decoded && decoded->tile.cpu)
 		histb_vdec_sync_surface_for_device(ctx, &decoded->tile,
 						    decoded->tile_noncoherent);
-	if (decoded && decoded->pmv.cpu)
-		histb_vdec_sync_surface_for_device(ctx, &decoded->pmv,
-						    decoded->pmv_noncoherent);
 }
 
 static int histb_vdec_copy_vc1_skipped_surface(
@@ -3136,12 +3067,6 @@ static int histb_vdec_copy_vc1_skipped_surface(
 	if (decoded->tile_noncoherent)
 		dma_sync_single_for_cpu(ctx->vdec->dev, decoded->tile.dma,
 					decoded->tile.size, DMA_BIDIRECTIONAL);
-	if (latest->tile_noncoherent)
-		dma_sync_single_for_cpu(ctx->vdec->dev, latest->pmv.dma,
-					latest->pmv.size, DMA_BIDIRECTIONAL);
-	if (decoded->pmv_noncoherent)
-		dma_sync_single_for_cpu(ctx->vdec->dev, decoded->pmv.dma,
-					decoded->pmv.size, DMA_BIDIRECTIONAL);
 	latest->tile.cpu_owned = true;
 	decoded->tile.cpu_owned = true;
 	memcpy(decoded->tile.cpu, latest->tile.cpu, decoded->tile.size);
@@ -3224,9 +3149,6 @@ static void histb_vdec_reset_apc(struct histb_vdec_ctx *ctx)
 		}
 		ctx->apc[i] = NULL;
 	}
-	mutex_lock(&ctx->mvc_lock);
-	histb_mvc_ingress_init(&ctx->mvc_ingress);
-	mutex_unlock(&ctx->mvc_lock);
 }
 
 static u32 histb_vdec_mpeg2_frame_height_mbs(
@@ -3282,6 +3204,9 @@ static int histb_vdec_begin_mpeg2_picture(
 		histb_vdec_reset_mpeg2_field_pair(ctx);
 	}
 
+	ctx->deint_interlaced = !(sequence->flags & V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE) &&
+		(field_picture || !(picture->flags & V4L2_MPEG2_PIC_FLAG_PROGRESSIVE));
+	ctx->deint_tff = picture->flags & V4L2_MPEG2_PIC_FLAG_TOP_FIELD_FIRST;
 	ctx->mpeg2_picture_started = true;
 	ctx->mpeg2_picture_valid = false;
 	ctx->mpeg2_field_picture = field_picture;
@@ -3373,8 +3298,6 @@ static bool histb_vdec_h264_current_apc_valid(
 
 	if (decoded->apc_slot == HISTB_VDEC_APC_INVALID)
 		return true;
-	if (ctx->mvc_ingress.subset.is_valid && ctx->mvc_ingress.active >= 0)
-		return ctx->mvc_ingress.surface[ctx->mvc_ingress.active].buffer == decoded;
 	if (!ctx->h264_second_field)
 		return false;
 
@@ -3400,7 +3323,7 @@ histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 	bool keep[HISTB_VDEC_H264_DPB_SIZE] = {};
 	unsigned int i, slot;
 
-	memset(dpb_to_apc, HISTB_VDEC_APC_INVALID, HISTB_VDEC_H264_DPB_MAP_SIZE);
+	memset(dpb_to_apc, HISTB_VDEC_APC_INVALID, HISTB_VDEC_H264_DPB_SIZE);
 	for (i = 0; i < ARRAY_SIZE(decode->dpb); i++) {
 		unsigned int j;
 
@@ -3427,8 +3350,7 @@ histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 	}
 
 	for (slot = 0; slot < ARRAY_SIZE(ctx->apc); slot++) {
-		if (!ctx->apc[slot] || keep[slot] ||
-		    histb_vdec_mvc_busy(ctx, ctx->apc[slot]))
+		if (!ctx->apc[slot] || keep[slot])
 			continue;
 		ctx->apc[slot]->apc_slot = HISTB_VDEC_APC_INVALID;
 		ctx->apc[slot] = NULL;
@@ -3470,8 +3392,7 @@ histb_vdec_post_owns_decoded(struct histb_vdec_ctx *ctx,
 static bool histb_vdec_use_hevc_surface_pool(const struct histb_vdec_ctx *ctx)
 {
 	return ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
-		(ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 ||
-		 ctx->dst.pix.width < ctx->src.pix.width ||
+		(ctx->dst.pix.width < ctx->src.pix.width ||
 		 ctx->dst.pix.height < ctx->src.pix.height);
 }
 
@@ -3496,7 +3417,7 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 			if (active[j] == active[i])
 				return -EINVAL;
 		if (active[i]->apc_slot >= 0 &&
-		    active[i]->apc_slot < V4L2_HEVC_DPB_ENTRIES_NUM_MAX &&
+		    active[i]->apc_slot < ARRAY_SIZE(ctx->apc) &&
 		    ctx->apc[active[i]->apc_slot] == active[i])
 			keep[active[i]->apc_slot] = true;
 		else
@@ -3504,7 +3425,7 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 	}
 
 	for (slot = 0; slot < ARRAY_SIZE(ctx->apc); slot++) {
-		if (!ctx->apc[slot] || (slot < ARRAY_SIZE(keep) && keep[slot]))
+		if (!ctx->apc[slot] || keep[slot])
 			continue;
 		ctx->apc[slot]->apc_slot = HISTB_VDEC_APC_INVALID;
 		if (!histb_vdec_use_hevc_surface_pool(ctx) &&
@@ -3514,10 +3435,10 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 	}
 	for (i = 0; i < decode->num_active_dpb_entries; i++) {
 		if (active[i]->apc_slot == HISTB_VDEC_APC_INVALID) {
-			for (slot = 0; slot < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; slot++)
+			for (slot = 0; slot < ARRAY_SIZE(ctx->apc); slot++)
 				if (!ctx->apc[slot])
 					break;
-			if (slot == V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
+			if (slot == ARRAY_SIZE(ctx->apc))
 				return -ENOSPC;
 			ctx->apc[slot] = active[i];
 			active[i]->apc_slot = slot;
@@ -3714,8 +3635,6 @@ histb_vdec_reclaim_decoded_buffers(struct histb_vdec_ctx *ctx,
 		if (decoded == output ||
 		    ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ||
 		    histb_vdec_post_owns_decoded(ctx, decoded) ||
-		    (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
-		     decoded->avs.valid) ||
 		    decoded->vp9_dpb_valid ||
 		    decoded->apc_slot != HISTB_VDEC_APC_INVALID)
 			continue;
@@ -3731,17 +3650,14 @@ histb_vdec_reclaim_decoded_buffers(struct histb_vdec_ctx *ctx,
 				memset(&decoded->pmv, 0, sizeof(decoded->pmv));
 				decoded->tile_noncoherent = true;
 				decoded->pmv_noncoherent = true;
-				continue;
 			}
-			/* Keep only one reusable surface; stale pool entries waste CMA. */
-			histb_vdec_free_decoded_buffers(ctx, decoded);
 			continue;
 		}
 		histb_vdec_free_decoded_buffers(ctx, decoded);
 	}
 }
 
-static int histb_vdec_cv200_configure_clock(struct histb_vdec_dev *vdec)
+static int histb_vdec_configure_vdh_clock(struct histb_vdec_dev *vdec)
 {
 	u32 mask = HISTB_CRG_VDH_CLK_SEL | HISTB_CRG_VDH_CLK_SKIP |
 		   HISTB_CRG_VDH_CLK_LOAD;
@@ -3751,37 +3667,10 @@ static int histb_vdec_cv200_configure_clock(struct histb_vdec_dev *vdec)
 	ret = regmap_update_bits(vdec->crg, HISTB_CRG_VDH_CLOCK, mask, 0);
 	if (ret)
 		return ret;
+
 	return regmap_update_bits(vdec->crg, HISTB_CRG_VDH_CLOCK,
 				  HISTB_CRG_VDH_CLK_LOAD,
 				  HISTB_CRG_VDH_CLK_LOAD);
-}
-
-static int histb_vdec_configure_vdh_clock(struct histb_vdec_dev *vdec)
-{
-	return vdec->backend->configure_clock(vdec);
-}
-static int histb_vdec_mv310_configure_clock(struct histb_vdec_dev *vdec)
-{
-	return histb_v5r6_configure_clock(vdec->crg);
-}
-
-static int histb_vdec_mv310_reset(struct histb_vdec_dev *vdec)
-{
-	int ret;
-
-	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
-	ret = histb_v5r6_reset(vdec->regs);
-	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
-	return ret;
-}
-static int histb_vdec_mv310_reset_vdh(struct histb_vdec_dev *vdec)
-{
-	return histb_v5r6_reset(vdec->regs);
-}
-
-static int histb_vdec_mv310_reset_bpd(struct histb_vdec_dev *vdec)
-{
-	return histb_v5r6_reset_bpd(vdec->regs);
 }
 
 static void histb_vdec_account_job(struct histb_vdec_dev *vdec, bool error)
@@ -3912,18 +3801,10 @@ static void histb_vdec_detile_nv12(struct histb_vdec_ctx *ctx,
 {
 	u32 width = ctx->src.pix.width;
 	u32 height = ctx->src.pix.height;
-	u32 dst_stride = ctx->dst.pix.bytesperline;
-	u32 dst_chroma = dst_stride * ctx->dst.pix.height;
 	u32 stride = histb_vdec_surface_stride(ctx);
 	u32 chroma_base = stride *
 		ALIGN(height, histb_vdec_surface_height_align(ctx));
 	u32 row, column;
-
-	if (ctx->vc1 && ctx->vc1_annex_l &&
-	    ctx->vc1_pending_picture.res_pic) {
-		width = ctx->vc1_pending_picture.coded_width;
-		height = ctx->vc1_pending_picture.coded_height;
-	}
 
 	for (row = 0; row < height; row++) {
 		for (column = 0; column < width; column += 64) {
@@ -3934,29 +3815,29 @@ static void histb_vdec_detile_nv12(struct histb_vdec_ctx *ctx,
 				1024 * tile_x + 64 * histb_vdec_row_map_y[index];
 			u32 length = min_t(u32, width - column, 64);
 
-			memcpy(dst + row * dst_stride + column, src + source, length);
+			memcpy(dst + row * width + column, src + source, length);
 		}
 	}
 
-	for (row = 0; row < DIV_ROUND_UP(height, 2); row++) {
-		for (column = 0; column < ALIGN(width, 2); column += 64) {
+	for (row = 0; row < height / 2; row++) {
+		for (column = 0; column < width; column += 64) {
 			u32 tile_x = column / 64;
 			u32 index = (row & 7) + 8 *
 				(((row / 8) & 1) * 4 + (tile_x & 3));
 			u32 source = chroma_base + stride * 8 * (row / 8) +
 				512 * tile_x + 64 * histb_vdec_row_map_uv[index];
-			u32 length = min_t(u32, ALIGN(width, 2) - column, 64);
+			u32 length = min_t(u32, width - column, 64);
 			u32 offset;
 
 			if (!swap_uv) {
-				memcpy(dst + dst_chroma + row * dst_stride + column,
+				memcpy(dst + width * height + row * width + column,
 				       src + source, length);
 				continue;
 			}
 			for (offset = 0; offset < length; offset += 2) {
-				dst[dst_chroma + row * dst_stride + column + offset] =
+				dst[width * height + row * width + column + offset] =
 					src[source + offset + 1];
-				dst[dst_chroma + row * dst_stride + column + offset + 1] =
+				dst[width * height + row * width + column + offset + 1] =
 					src[source + offset];
 			}
 		}
@@ -3968,8 +3849,6 @@ static void histb_vdec_detile_p010(struct histb_vdec_ctx *ctx,
 {
 	u32 width = ctx->src.pix.width;
 	u32 height = ctx->src.pix.height;
-	u32 dst_stride = ctx->dst.pix.bytesperline / sizeof(*dst);
-	u32 dst_chroma = dst_stride * ctx->dst.pix.height;
 	u32 stride = histb_vdec_surface_stride(ctx);
 	u32 aligned_height = ALIGN(height, histb_vdec_surface_height_align(ctx));
 	u32 chroma_base = stride * aligned_height;
@@ -3982,18 +3861,11 @@ static void histb_vdec_detile_p010(struct histb_vdec_ctx *ctx,
 			u32 tile_x = column / 64;
 			u32 high_index = (row & 15) + 16 *
 				(((row / 16) & 1) * 4 + (tile_x & 3));
-			/* V5R6 g_vfmw_row_map_table_y, not the VPSS row table. */
-			u32 high_row = ctx->vdec->mv310 ?
-				(row & 15) ^ ((tile_x & 3) << 2) :
-				histb_vdec_row_map_y[high_index];
 			u32 high_source = stride * 16 * (row / 16) +
-				1024 * tile_x + 64 * high_row;
+				1024 * tile_x +
+				64 * histb_vdec_row_map_y[high_index];
 			u32 low_index = (row & 31) + ((tile_x & 3) << 5);
-			/* V5R6 image_dec_tile_to_2d: each 64x2 block is 32 bytes. */
-			u32 low_source = ctx->vdec->mv310 ?
-				low_base + (stride / 4) * 2 * (row / 2) +
-				32 * tile_x + 16 * (row & 1) :
-				low_base + stride * 8 * (row / 32) +
+			u32 low_source = low_base + stride * 8 * (row / 32) +
 				512 * tile_x +
 				16 * histb_vdec_row_map_y_2bit(low_index);
 			u32 length = min_t(u32, width - column, 64);
@@ -4003,43 +3875,38 @@ static void histb_vdec_detile_p010(struct histb_vdec_ctx *ctx,
 				put_unaligned(histb_vdec_pack_p010(
 					get_unaligned_le32(src + high_source + offset),
 					src[low_source + offset / 4], false),
-					(__le64 *)(dst + row * dst_stride + column + offset));
+					(__le64 *)(dst + row * width + column + offset));
 			for (; offset < length; offset++)
-				dst[row * dst_stride + column + offset] =
+				dst[row * width + column + offset] =
 					histb_vdec_p010_sample(src + high_source,
 							       src[low_source + offset / 4], offset,
 						false);
 		}
 	}
 
-	for (row = 0; row < DIV_ROUND_UP(height, 2); row++) {
-		for (column = 0; column < ALIGN(width, 2); column += 64) {
+	for (row = 0; row < height / 2; row++) {
+		for (column = 0; column < width; column += 64) {
 			u32 tile_x = column / 64;
 			u32 high_index = (row & 7) + 8 *
 				(((row / 8) & 1) * 4 + (tile_x & 3));
-			u32 high_row = ctx->vdec->mv310 ?
-				(row & 7) ^ ((tile_x & 1) << 2) :
-				histb_vdec_row_map_uv[high_index];
 			u32 high_source = chroma_base + stride * 8 * (row / 8) +
-				512 * tile_x + 64 * high_row;
+				512 * tile_x +
+				64 * histb_vdec_row_map_uv[high_index];
 			u32 low_index = row & 15;
-			u32 low_source = ctx->vdec->mv310 ?
-				low_chroma_base + (stride / 4) * 2 * (row / 2) +
-				32 * tile_x + 16 * (row & 1) :
-				low_chroma_base + stride * 4 * (row / 16) +
+			u32 low_source = low_chroma_base + stride * 4 * (row / 16) +
 				256 * tile_x +
 				16 * histb_vdec_row_map_uv_2bit(low_index);
-			u32 length = min_t(u32, ALIGN(width, 2) - column, 64);
+			u32 length = min_t(u32, width - column, 64);
 			u32 offset;
 
 			for (offset = 0; offset + 4 <= length; offset += 4)
 				put_unaligned(histb_vdec_pack_p010(
 					get_unaligned_le32(src + high_source + offset),
 					src[low_source + offset / 4], true),
-					(__le64 *)(dst + dst_chroma + row * dst_stride +
+					(__le64 *)(dst + width * height + row * width +
 						 column + offset));
 			for (; offset < length; offset++)
-				dst[dst_chroma + row * dst_stride + column + offset] =
+				dst[width * height + row * width + column + offset] =
 					histb_vdec_p010_sample(src + high_source,
 							       src[low_source + offset / 4], offset,
 						true);
@@ -4105,7 +3972,17 @@ static void histb_vdec_scale_vc1_respic_nv12(u8 *dst, u32 stride,
 				       output_height / 2, 2);
 }
 
-/* The wrapper's cookie callback delegates to the selected DMA backend. */
+/*
+ * The DMA address of a capture buffer, for whichever backend allocated it.
+ *
+ * vb2_dma_contig_plane_dma_addr() reads vb->planes[].mem_priv as a
+ * struct vb2_dma_contig_buf.  That is only true for the dma-contig backend;
+ * the cacheable backend stores a struct histb_vdec_capture_mem there instead,
+ * so calling the dma-contig accessor on it dereferences the wrong struct and
+ * reads a NULL dma_addr_t, which is what produced the
+ * "Unable to handle kernel NULL pointer dereference" at
+ * histb_vdec_copy_capture+0x88 in the postprocess workqueue.
+ */
 static dma_addr_t histb_vdec_capture_dma(struct vb2_buffer *vb,
 					 unsigned int plane)
 {
@@ -4114,13 +3991,129 @@ static dma_addr_t histb_vdec_capture_dma(struct vb2_buffer *vb,
 	if (mem->ops == &histb_vdec_cached_memops)
 		return ((struct histb_vdec_cached_buf *)mem->priv)->dma;
 
-	/* Vmalloc capture storage has no device address. */
+	/*
+	 * vb2_vmalloc_memops has no device address at all - it is plain CPU
+	 * memory - so it must not reach the dma-contig accessor either.  No
+	 * caller asks for an address on a vmalloc buffer today (the only call
+	 * site is guarded by NV12, which selects dma-contig), but reading the
+	 * wrong struct here is exactly the fault that was just fixed, and
+	 * leaving the guard implicit would reintroduce it the first time
+	 * someone asks for a P010 capture address.
+	 */
 	if (mem->ops == &vb2_vmalloc_memops)
 		return 0;
 
 	return vb2_dma_contig_plane_dma_addr(vb, plane);
 }
 
+
+/*
+ * Deinterlace through the VPSS DEI block (control "Deinterlace" = 1).
+ *
+ * The decoder reconstructs a WOVEN frame (both fields interleaved).  The DEI
+ * block wants four consecutive fields LAST / CUR / NEXT1 / NEXT2 in display
+ * order; the decoder only hands out the current frame, and clients reorder
+ * B-frames later, so the window is built from what is available when the
+ * frame is decoded and needs no future frame:
+ *
+ *   top-field-first frame n:   LAST = bottom of the previous woven frame,
+ *                              CUR = top(n), NEXT1 = bottom(n), NEXT2 = top(n)
+ *   bottom-field-first:        the same with the parities swapped.
+ *
+ * That is a 3-field motion-adaptive deinterlace (previous opposite field vs
+ * next opposite field decides "moving"); NEXT2 repeats CUR because the field
+ * after it belongs to a frame that is not decoded yet.  "Previous" is the
+ * previous DECODED frame: with B-frames that is not the previous DISPLAYED
+ * one, which makes the motion test see motion where there is none and fall
+ * back to spatial interpolation - softer, never combed, never wrong in time.
+ *
+ * The output is one progressive frame per interlaced frame (frame rate).
+ * Two private woven buffers ping-pong: the VPSS detiles into one, DEI reads
+ * it and the other (the previous frame) and writes the client's buffer.
+ * Returns -ENOTSUPP when the configuration is outside the block's limits so
+ * the caller falls back to the plain woven output.
+ */
+static int histb_vdec_deinterlace(struct histb_vdec_ctx *ctx,
+				  struct histb_vpss_frame *frame,
+				  dma_addr_t out_dma)
+{
+	u32 stride = ctx->dst.pix.bytesperline, w = ctx->dst.pix.width;
+	u32 h = ctx->dst.pix.height;
+	size_t size = (size_t)stride * h * 3 / 2;
+	struct histb_vdec_dma_buffer *cur = &ctx->deint_w[ctx->deint_cur];
+	struct histb_vdec_dma_buffer *prev = &ctx->deint_w[ctx->deint_cur ^ 1];
+	struct histb_vpss_dei_frame dei = {};
+	dma_addr_t c, p;
+	unsigned int i;
+	int ret;
+
+	if (w > 1920 || h > 1088 || (h & 1) || (stride & 15) || stride < w ||
+	    frame->width != w || frame->height != h)
+		return -ENOTSUPP;
+	for (i = 0; i < ARRAY_SIZE(ctx->deint_w); i++) {
+		struct histb_vdec_dma_buffer *b = &ctx->deint_w[i];
+
+		if (b->cpu && b->size >= size)
+			continue;
+		if (b->cpu)
+			dma_free_coherent(ctx->vdec->dev, b->size, b->cpu, b->dma);
+		b->cpu = dma_alloc_coherent(ctx->vdec->dev, ALIGN(size, SZ_4K),
+					    &b->dma, GFP_KERNEL);
+		if (!b->cpu) {
+			memset(b, 0, sizeof(*b));
+			return -ENOMEM;
+		}
+		b->size = ALIGN(size, SZ_4K);
+		ctx->deint_prev_valid = false;
+	}
+	cur = &ctx->deint_w[ctx->deint_cur];
+	prev = &ctx->deint_w[ctx->deint_cur ^ 1];
+
+	frame->output_dma = cur->dma;
+	frame->output_cpu = NULL;
+	ret = histb_vpss_detile(ctx->vdec->vpss, frame);
+	if (ret)
+		return ret;
+
+	c = cur->dma;
+	p = ctx->deint_prev_valid ? prev->dma : cur->dma;
+	if (ctx->deint_tff) {
+		dei.ref_dma = p + stride;
+		dei.cur_dma = c;
+		dei.nxt1_dma = c + stride;
+		dei.nxt2_dma = c;
+	} else {
+		dei.ref_dma = p;
+		dei.cur_dma = c + stride;
+		dei.nxt1_dma = c;
+		dei.nxt2_dma = c + stride;
+		dei.bottom_field = true;
+	}
+	dei.top_field_first = ctx->deint_tff;
+	dei.width = w;
+	dei.height = h / 2;
+	dei.stride = stride;
+	dei.output_stride = stride;
+	ret = histb_vpss_dei(ctx->vdec->vpss, &dei, out_dma);
+	if (ret)
+		return ret;
+	ctx->deint_cur ^= 1;
+	ctx->deint_prev_valid = true;
+	return 0;
+}
+
+static bool histb_vdec_deinterlace_wanted(struct histb_vdec_ctx *ctx)
+{
+	struct v4l2_ctrl *c;
+
+	if (!ctx->deint_interlaced ||
+	    (ctx->src.pix.pixelformat != V4L2_PIX_FMT_H264_SLICE &&
+	     ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG2_SLICE) ||
+	    ctx->dst.pix.pixelformat != V4L2_PIX_FMT_NV12)
+		return false;
+	c = v4l2_ctrl_find(&ctx->ctrl_handler, HISTB_VDEC_CID_DEINTERLACE);
+	return c && c->cur.val == 1;
+}
 
 static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 				   struct vb2_v4l2_buffer *dst_buf)
@@ -4136,11 +4129,15 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	if (!dst_buf)
 		return -EPIPE;
 	decoded = histb_vdec_decoded_buffer(dst_buf);
-	if (ctx->avs2 && ctx->avs2->output_slot >= 0)
-		decoded = &ctx->avs2->surface[ctx->avs2->output_slot];
-	if (ctx->mpeg1 && ctx->mpeg1->output_slot >= 0)
-		decoded = &ctx->mpeg1->surface[ctx->mpeg1->output_slot];
-	dst = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
+	/*
+	 * A CPU mapping is needed only by the staging (P010) path, the VC-1
+	 * range map and the CPU fallback; the direct NV12 path is DMA only.
+	 * Asking for it maps the whole buffer, and for 4K buffers those
+	 * mappings do not fit the 32-bit vmalloc window.
+	 */
+	dst = NULL;
+	if (ctx->dst.pix.pixelformat != V4L2_PIX_FMT_NV12 || ctx->vc1)
+		dst = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
 	if (!decoded->tile.cpu)
 		return -EOPNOTSUPP;
 	dst_dma = 0;
@@ -4151,39 +4148,23 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	if (dst)
 		dst += dst_buf->vb2_buf.planes[0].data_offset;
 
-	/* The validated VDH IRQ precedes all reconstruction-surface DMA reads. */
+	/*
+	 * The threaded IRQ publishes post-processing only after validating the
+	 * completed picture state, its UP reports and both SMMU status words.
+	 * HISTB_VDEC_STATE is cleared as that interrupt is acknowledged, so
+	 * polling it here can never prove that later FSP stores finished; the old
+	 * loop consequently paid its full 60 ms budget on every 4K picture.
+	 * Order the already completed DMA writes before handing the surface to
+	 * VPSS instead.
+	 */
 	dma_rmb();
-	if (ctx->vdec->mv310 && ctx->hevc_main10 &&
-	    ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010) {
-		/*
-		 * Keep the VDH's exact ten-bit reconstruction. The MV310 VPSS
-		 * route currently loses its low bits; use the native VFMW tile
-		 * layout, not CV200's two-bit swizzles or an eight-bit expansion.
-		 */
-		if (!dst || ctx->src.pix.width != ctx->dst.pix.width ||
-		    ctx->src.pix.height != ctx->dst.pix.height)
-			return -EOPNOTSUPP;
-		if (decoded->tile.size < histb_vdec_tile_size(ctx))
-			return -ERANGE;
-		ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
-		if (ret)
-			return ret;
-		if (decoded->tile_noncoherent && !decoded->tile.cpu_owned)
-			dma_sync_single_for_cpu(ctx->vdec->dev, decoded->tile.dma,
-						decoded->tile.size, DMA_BIDIRECTIONAL);
-		decoded->tile.cpu_owned = true;
-		dma_rmb();
-		histb_vdec_detile_p010(ctx, decoded->tile.cpu, (__le16 *)dst);
-		/* References remain device-owned after this synchronous copy. */
-		histb_vdec_sync_tile_for_device(ctx, decoded);
-		return 0;
-	}
-	/* Transfer CPU-owned reconstruction storage back to the DMA domain. */
+	/* VDH and VPSS share the DMA/device view. Only a real CPU access
+	 * needs cache ownership transfer; repeatedly cleaning all UHD
+	 * references here and at launch is unnecessary pixel-sized work. */
 	histb_vdec_sync_tile_for_device(ctx, decoded);
 	memset(&frame, 0, sizeof(frame));
 	frame.input_dma = decoded->tile.dma;
 	frame.input_size = decoded->tile.size;
-	frame.output_size = vb2_plane_size(&dst_buf->vb2_buf, 0);
 	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12)
 		frame.output_dma = dst_dma;
 	frame.output_cpu = dst;
@@ -4199,41 +4180,49 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	}
 	frame.input_stride = histb_vdec_surface_stride(ctx);
 	frame.input_height_align = histb_vdec_surface_height_align(ctx);
+	/*
+	 * A client that asks for the visible size (1080) on a stream whose OUTPUT
+	 * format is the macroblock-aligned coded size (1088, FFmpeg's MPEG-2) does
+	 * not want a resample: the surface layout is identical (it is derived
+	 * from the aligned height) and the extra rows are only padding.  Telling
+	 * VPSS the input is 1088 rows made it scale 1088 -> 1080, which low-passes
+	 * every row (a 31 dB PSNR against software on detailed content).  Crop
+	 * instead: hand VPSS the visible size as the input size.
+	 */
+	if (frame.width <= frame.input_width &&
+	    frame.height <= frame.input_height &&
+	    ALIGN(frame.width, 16) == ALIGN(frame.input_width, 16) &&
+	    ALIGN(frame.height, frame.input_height_align) ==
+		ALIGN(frame.input_height, frame.input_height_align)) {
+		frame.input_width = frame.width;
+		frame.input_height = frame.height;
+	}
 	frame.output_stride = ctx->dst.pix.bytesperline;
 	frame.input_ten_bit = ctx->hevc_main10;
 	frame.output_ten_bit =
 		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010;
-	frame.hdr10_to_sdr = ctx->hevc_main10 && !frame.output_ten_bit;
-	if (ctx->vdec->mv310) {
-		u32 height = ALIGN(ctx->src.pix.height, frame.input_height_align);
-
-		frame.input_layout = HISTB_VPSS_INPUT_MV310_TILE;
-		frame.input_c_offset = frame.input_stride * height;
-		frame.input_c_stride = frame.input_stride;
-		frame.input_low_stride = frame.input_stride / 4;
-		frame.input_low_y_offset = frame.input_c_offset * 3 / 2;
-		frame.input_low_c_offset = frame.input_low_y_offset +
-			frame.input_low_stride * height;
-		/* Selected vdec_v2.1 translates SPYCbCr420 to NV21_TILE. */
-		frame.input_nv21 = true;
-		frame.hdr10_to_sdr = false;
-	}
-	if (!dst_dma && dst) {
-		ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
-		if (ret)
+	if (dst_dma && histb_vdec_deinterlace_wanted(ctx)) {
+		ret = histb_vdec_deinterlace(ctx, &frame, dst_dma);
+		if (!ret)
+			return histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
+		if (ret != -ENOTSUPP)
 			return ret;
+		/* outside the block's limits: plain woven output below */
 	}
 	ret = histb_vpss_detile(ctx->vdec->vpss, &frame);
 	if (!ret) {
-		/* Acquire CPU ownership before range mapping or userspace access. */
+		/*
+		 * VPSS wrote the output surface by DMA.  With cacheable capture
+		 * buffers those writes sit in the cache as dirty lines the CPU
+		 * may not see, so invalidate before anyone reads the frame.
+		 * begin_cpu_access() is idempotent, so the call inside
+		 * apply_vc1_range_map() is harmless when it also fires.
+		 */
 		ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
 		if (ret)
 			return ret;
 		return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
 	}
-	/* MV310 must never read its tiles through CV200's CPU address tables. */
-	if (ctx->vdec->mv310)
-		return ret;
 	if (dst_dma && ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12)
 		return ret;
 	dev_warn_ratelimited(ctx->vdec->dev,
@@ -4258,16 +4247,11 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 					decoded->tile.size,
 					DMA_BIDIRECTIONAL);
 	decoded->tile.cpu_owned = true;
-	if (decoded->pmv.cpu)
-		decoded->pmv.cpu_owned = true;
 	/* Order reconstruction-surface DMA writes after the observed VDH IRQ. */
 	dma_rmb();
-	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010) {
-		/* The CPU path consumes the VDH's separate 2-bit planes. */
-		if (!ctx->hevc_main10)
-			return ret;
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010)
 		histb_vdec_detile_p010(ctx, decoded->tile.cpu, (__le16 *)dst);
-	} else {
+	else {
 		histb_vdec_detile_nv12(ctx, decoded->tile.cpu, dst, true);
 		if (frame.input_width != frame.width ||
 		    frame.input_height != frame.height)
@@ -4280,9 +4264,14 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
 }
 
-static inline struct histb_vdec_ctx *fh_to_histb_vdec_ctx(void *priv)
+/*
+ * ⛔ 6.18: the V4L2 core no longer passes the struct v4l2_fh as the ioctl "priv" argument (it is
+ * NULL); take it from file->private_data. Using priv oopsed in s_fmt at the first GStreamer probe
+ * (NULL + 0x4c) and left vdec->lock held for good — measured on the box 2026-10-11.
+ */
+static inline struct histb_vdec_ctx *file_to_histb_vdec_ctx(struct file *file)
 {
-	return container_of(priv, struct histb_vdec_ctx, fh);
+	return container_of(file_to_v4l2_fh(file), struct histb_vdec_ctx, fh);
 }
 
 static struct histb_vdec_q_data *
@@ -4309,23 +4298,10 @@ static __le32 *histb_vdec_msg_slot(struct histb_vdec_ctx *ctx,
 
 static __le32 *histb_vdec_hevc_msg_slot(__le32 *base, unsigned int slot)
 {
-	return base + slot * HISTB_VDEC_HEVC_MSG_SLOT_WORDS;
-}
+	unsigned int words = slot;
 
-static __le32 *histb_vdec_avs_pic_msg(struct histb_vdec_ctx *ctx)
-{
-	u8 *base = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu;
-
-	return (__le32 *)(base + HISTB_VDEC_AVS_PIC_MSG_OFFSET);
-}
-
-static __le32 *histb_vdec_avs_slice_msg(struct histb_vdec_ctx *ctx,
-					unsigned int slice)
-{
-	u8 *base = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu;
-
-	return (__le32 *)(base + HISTB_VDEC_AVS_SLICE_MSG_OFFSET +
-			  slice * HISTB_VDEC_AVS_SLICE_MSG_SIZE);
+	words *= HISTB_VDEC_HEVC_MSG_SLOT_WORDS;
+	return base + words;
 }
 
 static bool histb_vdec_dma_buffers_valid(struct histb_vdec_ctx *ctx)
@@ -4340,47 +4316,10 @@ static bool histb_vdec_dma_buffers_valid(struct histb_vdec_ctx *ctx)
 	return true;
 }
 
-static bool histb_vdec_smmu_dma_buffer_valid(
-		const struct histb_vdec_dma_buffer *buffer)
+/* Every supported codec runs with the VDH MMU in bypass (AVS, which needed it, is not carried). */
+static void histb_vdec_smmu_bypass(struct histb_vdec_dev *vdec)
 {
-	return buffer->cpu &&
-	       histb_media_smmu_dma_range_valid(buffer->dma, buffer->size);
-}
-
-static bool histb_vdec_smmu_dma_buffers_valid(struct histb_vdec_ctx *ctx)
-{
-	unsigned int i;
-
-	for (i = 0; i < HISTB_VDEC_BUF_COUNT; i++)
-		if (ctx->buffers[i].size &&
-		    !histb_vdec_smmu_dma_buffer_valid(&ctx->buffers[i]))
-			return false;
-
-	return true;
-}
-
-
-static void histb_vdec_program_smmu(struct histb_vdec_dev *vdec, bool enable)
-{
-	if (!enable) {
-		writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
-		return;
-	}
-
-	if (WARN_ON(!histb_media_smmu_ready(&vdec->smmu))) {
-		writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
-		return;
-	}
-
-	writel(lower_32_bits(histb_media_smmu_pt_dma(&vdec->smmu)),
-	       vdec->regs + HISTB_VDEC_SMMU_PGTABLE_ADDR);
-	writel(lower_32_bits(histb_media_smmu_err_rd_dma(&vdec->smmu)),
-	       vdec->regs + HISTB_VDEC_SMMU_ERR_RD_ADDR);
-	writel(lower_32_bits(histb_media_smmu_err_wr_dma(&vdec->smmu)),
-	       vdec->regs + HISTB_VDEC_SMMU_ERR_WR_ADDR);
-	/* Publish the table and error sinks before enabling translation. */
-	wmb();
-	writel(8, vdec->regs + HISTB_VDEC_SMMU_CTRL);
+	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
 }
 
 static int histb_vdec_mpeg4_result_to_errno(int result)
@@ -4667,8 +4606,7 @@ static int histb_vdec_resize_vc1_stream(struct histb_vdec_ctx *ctx,
 	size_t allocation;
 
 	if (required > HISTB_VDEC_MAX_BITSTREAM ||
-	    check_add_overflow(required,
-			       ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat),
+	    check_add_overflow(required, (size_t)HISTB_VDEC_RAW_STREAM_GUARD,
 			       &required) || required > SIZE_MAX - (SZ_64K - 1))
 		return -EOVERFLOW;
 	allocation = ALIGN(required, SZ_64K);
@@ -5089,8 +5027,6 @@ static int histb_vdec_prepare_vc1_picture_message(
 	ret = histb_vc1_build_pic_msg(&picture, &message);
 	if (ret)
 		return histb_vdec_vc1_result_to_errno(ret);
-	if (ctx->vdec->mv310)
-		histb_vc1_encode_v5r6_pic_msg(&message);
 	words = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu +
 		HISTB_VDEC_VC1_PIC_MSG_OFFSET;
 	for (i = 0; i < ARRAY_SIZE(message.d); i++)
@@ -5275,8 +5211,6 @@ static int histb_vdec_prepare_vc1_smp_syntax(
 		slice_messages, 1, &stream_base);
 	if (parser_ret)
 		return histb_vdec_vc1_result_to_errno(parser_ret);
-	if (ctx->vdec->mv310)
-		histb_vc1_encode_v5r6_slice_messages(slice_messages, 1);
 	histb_vdec_set_vc1_smp_headers(ctx, &smp);
 	ctx->vc1_pending_picture = picture;
 	ctx->vc1_pending_output = decoded;
@@ -5568,8 +5502,6 @@ picture_found:
 			ret = histb_vdec_vc1_result_to_errno(ret);
 			goto free_slices;
 		}
-		if (ctx->vdec->mv310)
-			histb_vc1_encode_v5r6_slice_messages(slice_messages, part_count);
 	}
 
 	ctx->vc1_sequence = sequence;
@@ -5653,14 +5585,36 @@ static int histb_vdec_prepare_mpeg4(
 		ctx->mpeg4_au_offset = 0;
 		ctx->mpeg4_au_active = true;
 	} else if (ctx->mpeg4_au_src != src) {
-		/* A different queued source starts a new access unit. */
+		/*
+		 * A stateful client feeds one access unit per queue job and
+		 * never re-submits a buffer, so a new source means a new
+		 * unit: take a fresh copy and parse it from the start.
+		 * Re-submitting the same buffer keeps the original meaning
+		 * of continuing the unit already in ctx->bitstream, which is
+		 * what the stateless-style client does.
+		 */
 		ret = histb_vdec_copy_raw_bitstream(ctx, src, payload, src_dma);
 		if (ret)
 			return ret;
 		ctx->mpeg4_au_src = src;
 		ctx->mpeg4_au_bytes = payload;
 		ctx->mpeg4_au_offset = 0;
-		/* VOP timing spans access units and is committed with each picture. */
+		/*
+		 * The timing state is the one part of the parser that must
+		 * not survive into a new access unit.  time_base accumulates
+		 * monotonically and the B-frame reorder check derives
+		 * to_future = last_non_b_time - time from it, so a unit
+		 * parsed on top of the previous unit's timing makes every
+		 * timestamp look inconsistent and every VOP gets skipped:
+		 * the client sees a clean decode that produces no frames.
+		 * Keep the VOL - the client does not repeat it in every
+		 * unit - and clear only the timing.
+		 */
+		ctx->mpeg4_parser.last_non_b_time = 0;
+		ctx->mpeg4_parser.last_time_base = 0;
+		ctx->mpeg4_parser.time_base = 0;
+		ctx->mpeg4_parser.time_pp = 0;
+		ctx->mpeg4_parser.have_non_b_time = 0;
 	} else {
 		*src_dma = ctx->bitstream.dma;
 	}
@@ -5825,15 +5779,6 @@ static int histb_vdec_prepare_mpeg4(
 		ret = histb_vdec_mpeg4_result_to_errno(ret);
 		goto free_slices;
 	}
-	if (ctx->vdec->mv310) {
-		histb_mpeg4_encode_v5r6_pic_msg(&pic_msg);
-		ret = histb_mpeg4_encode_v5r6_slice_messages(slice_msgs,
-								message_count);
-		if (ret) {
-			ret = histb_vdec_mpeg4_result_to_errno(ret);
-			goto free_slices;
-		}
-	}
 
 	memset(ctx->buffers[HISTB_VDEC_BUF_MSG].cpu, 0,
 	       ctx->buffers[HISTB_VDEC_BUF_MSG].size);
@@ -5878,778 +5823,7 @@ static const void *histb_vdec_ctrl_data(struct histb_vdec_ctx *ctx, u32 id)
 	return ctrl ? ctrl->p_cur.p : NULL;
 }
 
-static int
-histb_vdec_validate_avs(struct histb_vdec_ctx *ctx,
-			const struct v4l2_ctrl_avs_sequence *sequence,
-			const struct v4l2_ctrl_avs_picture *picture,
-			const struct v4l2_ctrl_avs_slice_params *slices,
-			unsigned int num_slices,
-			const struct v4l2_ctrl_avs_decode_params *decode,
-			const u8 *payload_data, unsigned long payload)
-{
-	static const u32 picture_flags =
-		V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME |
-		V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST |
-		V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD |
-		V4L2_AVS_PICTURE_FLAG_FIXED_QP |
-		V4L2_AVS_PICTURE_FLAG_SKIP_MODE |
-		V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE |
-		V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_PARAMS |
-		V4L2_AVS_PICTURE_FLAG_REFERENCE |
-		V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE |
-		V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_DISABLE |
-		V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT |
-		V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE |
-		V4L2_AVS_PICTURE_FLAG_AEC |
-		V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED |
-		V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED;
-	u32 width_mbs, height_mbs, total_mbs;
-	unsigned int i;
-
-	if (!sequence || !picture || !slices || !decode || !payload_data ||
-	    payload < 4 || payload > HISTB_VDEC_MAX_BITSTREAM ||
-	    (u64)payload * 8 > GENMASK(24, 0) ||
-	    !num_slices || num_slices > HISTB_VDEC_AVS_MAX_SLICES ||
-	    memchr_inv(sequence->reserved, 0, sizeof(sequence->reserved)) ||
-	    memchr_inv(picture->reserved, 0, sizeof(picture->reserved)) ||
-	    decode->reserved ||
-	    (sequence->profile_id != HISTB_VDEC_AVS_PROFILE_JIZHUN &&
-	     sequence->profile_id != HISTB_VDEC_AVS_PROFILE_GUANGDIAN) ||
-	    sequence->horizontal_size != ctx->src.pix.width ||
-	    sequence->vertical_size != ctx->src.pix.height ||
-	    sequence->horizontal_size < HISTB_VDEC_MIN_WIDTH ||
-	    sequence->vertical_size < HISTB_VDEC_MIN_HEIGHT ||
-	    sequence->horizontal_size > HISTB_VDEC_AVS_MAX_WIDTH ||
-	    sequence->vertical_size > HISTB_VDEC_AVS_MAX_HEIGHT ||
-	    sequence->chroma_format != 1 || sequence->sample_precision != 1 ||
-	    (sequence->flags & ~(V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE |
-				  V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY)) ||
-	    (picture->flags & ~picture_flags) ||
-	    picture->picture_coding_type > V4L2_AVS_PICTURE_TYPE_B ||
-	    picture->picture_structure > V4L2_AVS_PICTURE_STRUCTURE_FRAME ||
-	    picture->picture_qp > 63 ||
-	    picture->alpha_c_offset < -16 || picture->alpha_c_offset > 15 ||
-	    picture->beta_offset < -16 || picture->beta_offset > 15 ||
-	    (decode->flags &
-	     ~((u32)V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF |
-	       V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0 |
-	       V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF1)))
-		return -EINVAL;
-
-	/* A progressive sequence cannot switch to interlaced picture syntax. */
-	if ((sequence->flags & V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE) &&
-	    (picture->picture_structure != V4L2_AVS_PICTURE_STRUCTURE_FRAME ||
-	     !(picture->flags & V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME)))
-		return -EINVAL;
-	if (picture->picture_structure == V4L2_AVS_PICTURE_STRUCTURE_FIELD &&
-	    (picture->flags & V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME))
-		return -EINVAL;
-
-	/*
-	 * Field-enhanced syntax is the Guangdian AVS+ extension and is meaningful
-	 * only for the matching P/B field picture.
-	 */
-	if (picture->flags & (V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED |
-			      V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED)) {
-		if (sequence->profile_id != HISTB_VDEC_AVS_PROFILE_GUANGDIAN ||
-		    picture->picture_structure != V4L2_AVS_PICTURE_STRUCTURE_FIELD ||
-		    (picture->flags & V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED &&
-		     picture->picture_coding_type != V4L2_AVS_PICTURE_TYPE_P) ||
-		    (picture->flags & V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED &&
-		     picture->picture_coding_type != V4L2_AVS_PICTURE_TYPE_B) ||
-		    (picture->flags & V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED &&
-		     picture->flags & V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED))
-			return -EINVAL;
-	}
-
-	/* AVS+ fields do not exist in the JiZhun picture syntax. */
-	if ((sequence->profile_id == HISTB_VDEC_AVS_PROFILE_JIZHUN &&
-	     picture->bbv_delay > GENMASK(15, 0)) ||
-	    picture->bbv_delay > GENMASK(22, 0))
-		return -EINVAL;
-
-	if (sequence->profile_id == HISTB_VDEC_AVS_PROFILE_JIZHUN &&
-	    ((picture->flags & (V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT |
-			       V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE |
-			       V4L2_AVS_PICTURE_FLAG_AEC |
-			       V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED |
-			       V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED)) ||
-	     picture->chroma_qp_delta_u || picture->chroma_qp_delta_v))
-		return -EINVAL;
-
-	if (picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_I) {
-		if (decode->flags)
-			return -EINVAL;
-	} else if (picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_P) {
-		if ((decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF) ||
-		    !(decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0))
-			return -EINVAL;
-	} else if (!(decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF) ||
-		   !(decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0)) {
-		return -EINVAL;
-	}
-
-	width_mbs = DIV_ROUND_UP(sequence->horizontal_size, 16);
-	height_mbs = histb_vdec_avs_height_mbs(sequence->vertical_size,
-					       sequence->flags &
-					       V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE);
-	if (check_mul_overflow(width_mbs, height_mbs, &total_mbs) ||
-	    !total_mbs || slices[0].slice_start_mb)
-		return -EINVAL;
-
-	for (i = 0; i < num_slices; i++) {
-		u32 size, end;
-		u8 code;
-
-		if (slices[i].reserved || (slices[i].bit_size & 7) ||
-		    slices[i].bit_size < 32 ||
-		    slices[i].data_byte_offset > payload - 4 ||
-		    slices[i].slice_start_mb >= total_mbs ||
-		    (i && slices[i].slice_start_mb <=
-			    slices[i - 1].slice_start_mb))
-			return -EINVAL;
-		size = slices[i].bit_size / 8;
-		if ((size - 3) * 8U > GENMASK(24, 0))
-			return -ERANGE;
-		if (size > payload - slices[i].data_byte_offset ||
-		    check_add_overflow(slices[i].data_byte_offset, size, &end) ||
-		    (i + 1 < num_slices && end !=
-			    slices[i + 1].data_byte_offset))
-			return -EINVAL;
-		if (payload_data[slices[i].data_byte_offset] != 0 ||
-		    payload_data[slices[i].data_byte_offset + 1] != 0 ||
-		    payload_data[slices[i].data_byte_offset + 2] != 1)
-			return -EINVAL;
-		code = payload_data[slices[i].data_byte_offset + 3];
-		if (code > HISTB_VDEC_AVS_START_SLICE_MAX ||
-		    (u64)code * width_mbs != slices[i].slice_start_mb)
-			return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int
-histb_vdec_copy_avs_bitstream(struct histb_vdec_ctx *ctx,
-			      struct vb2_v4l2_buffer *src,
-			      unsigned long payload,
-			      const struct v4l2_ctrl_avs_slice_params *slices,
-			      unsigned int num_slices,
-			      dma_addr_t *stream_dma,
-			      struct histb_vdec_avs_stream *streams)
-{
-	struct histb_vdec_dma_buffer *stream = &ctx->bitstream;
-	struct histb_vdec_dev *vdec = ctx->vdec;
-	struct histb_vdec_dma_buffer replacement = { };
-	u8 *src_cpu;
-	unsigned int i;
-	size_t allocation;
-	size_t guard = vdec->backend->stream_guard(ctx->src.pix.pixelformat);
-
-	if (payload > SIZE_MAX - guard)
-		return -E2BIG;
-	allocation = payload + guard;
-	if (allocation > HISTB_VDEC_MAX_BITSTREAM)
-		return -E2BIG;
-	if (stream->size < allocation) {
-		allocation = ALIGN(allocation, SZ_64K);
-		replacement.cpu = dma_alloc_coherent(vdec->dev, allocation,
-						     &replacement.dma, GFP_KERNEL);
-		if (!replacement.cpu)
-			return -ENOMEM;
-		replacement.size = allocation;
-		if (!histb_vdec_smmu_dma_buffer_valid(&replacement) ||
-		    !IS_ALIGNED(replacement.dma, 16)) {
-			dma_free_coherent(vdec->dev, allocation, replacement.cpu,
-					  replacement.dma);
-			return -ERANGE;
-		}
-		if (stream->cpu)
-			dma_free_coherent(vdec->dev, stream->size, stream->cpu,
-					  stream->dma);
-		*stream = replacement;
-	}
-	if (!histb_vdec_smmu_dma_buffer_valid(stream))
-		return -ERANGE;
-	src_cpu = vb2_plane_vaddr(&src->vb2_buf, 0);
-	if (!src_cpu)
-		return -EOPNOTSUPP;
-	src_cpu += src->vb2_buf.planes[0].data_offset;
-	memcpy(stream->cpu, src_cpu, payload);
-	memset(stream->cpu + payload, 0, stream->size - payload);
-	for (i = 0; i < num_slices; i++) {
-		streams[i].data_offset = slices[i].data_byte_offset;
-		streams[i].size = slices[i].bit_size / 8;
-	}
-	*stream_dma = stream->dma;
-	return 0;
-}
-
-static bool
-histb_vdec_avs_ref_valid(const struct histb_vdec_avs_reference *reference)
-{
-	return reference->decoded && reference->metadata;
-}
-
-static bool
-histb_vdec_avs_decoded_smmu_valid(const struct histb_vdec_decoded_buffer *decoded)
-{
-	return histb_vdec_smmu_dma_buffer_valid(&decoded->tile) &&
-	       (!decoded->pmv.size ||
-		histb_vdec_smmu_dma_buffer_valid(&decoded->pmv));
-}
-
-static u32
-histb_vdec_avs_ref_distance(const struct histb_vdec_avs_reference *reference)
-{
-	return histb_vdec_avs_ref_valid(reference) ?
-		reference->metadata->picture_distance : 0;
-}
-
-static u32
-histb_vdec_avs_ref_structure(const struct histb_vdec_avs_reference *reference)
-{
-	return histb_vdec_avs_ref_valid(reference) &&
-	       reference->metadata->picture_structure ==
-	       V4L2_AVS_PICTURE_STRUCTURE_FRAME ? 3 : 1;
-}
-
-static u32
-histb_vdec_avs_ref_tff(const struct histb_vdec_avs_reference *reference)
-{
-	if (!histb_vdec_avs_ref_valid(reference))
-		return 0;
-	if (reference->metadata->picture_structure ==
-	    V4L2_AVS_PICTURE_STRUCTURE_FIELD)
-		return 1;
-	return reference->metadata->top_field_first;
-}
-
-static dma_addr_t
-histb_vdec_avs_ref_tile(const struct histb_vdec_avs_reference *reference)
-{
-	return histb_vdec_avs_ref_valid(reference) ?
-		round_down(reference->decoded->tile.dma, 16) : 0;
-}
-
-static dma_addr_t
-histb_vdec_avs_ref_pmv(const struct histb_vdec_avs_reference *reference)
-{
-	return histb_vdec_avs_ref_valid(reference) ?
-		round_down(reference->decoded->pmv.dma, 16) : 0;
-}
-
-static int
-histb_vdec_avs_reference(struct histb_vdec_ctx *ctx,
-			 struct histb_vdec_decoded_buffer *output,
-			 u64 timestamp,
-			 struct histb_vdec_avs_reference *reference)
-{
-	struct histb_vdec_decoded_buffer *decoded;
-
-	decoded = histb_vdec_find_reference(ctx, timestamp);
-	if (!decoded || decoded == output ||
-	    !histb_vdec_decoded_buffer_valid(decoded) ||
-	    !decoded->avs.valid || !decoded->avs.anchor)
-		return -EINVAL;
-
-	histb_vdec_propagate_error_taint(output, decoded);
-	histb_vdec_sync_tile_for_device(ctx, decoded);
-	reference->decoded = decoded;
-	reference->metadata = &decoded->avs;
-	return 0;
-}
-
-static int
-histb_vdec_avs_build_references(struct histb_vdec_ctx *ctx,
-				struct histb_vdec_decoded_buffer *output,
-				const struct v4l2_ctrl_avs_picture *picture,
-				const struct v4l2_ctrl_avs_decode_params *decode,
-				struct histb_vdec_avs_reference refs[3])
-{
-	unsigned int i, j;
-	int ret;
-
-	memset(refs, 0, sizeof(*refs) * 3);
-	if (picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_I &&
-	    picture->picture_structure == V4L2_AVS_PICTURE_STRUCTURE_FIELD) {
-		/*
-		 * CV200 promotes a field-I current surface to pRef0 while building
-		 * the transaction. It is not a persistent DPB reference.
-		 */
-		refs[0].decoded = output;
-		refs[0].metadata = &output->avs;
-	}
-	if (picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_B &&
-	    (decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF)) {
-		ret = histb_vdec_avs_reference(ctx, output,
-					       decode->backward_ref_ts, &refs[0]);
-		if (ret)
-			return ret;
-	}
-	if (decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0) {
-		i = picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_B ? 1 : 0;
-		ret = histb_vdec_avs_reference(ctx, output,
-					       decode->forward_ref_ts[0], &refs[i]);
-		if (ret)
-			return ret;
-	}
-	if (decode->flags & V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF1) {
-		i = picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_B ? 2 : 1;
-		ret = histb_vdec_avs_reference(ctx, output,
-					       decode->forward_ref_ts[1], &refs[i]);
-		if (ret)
-			return ret;
-	}
-
-	for (i = 0; i < 3; i++)
-		for (j = i + 1; refs[i].decoded && j < 3; j++)
-			if (refs[i].decoded == refs[j].decoded)
-				return -EINVAL;
-
-	return 0;
-}
-
-static u32 histb_vdec_avs_wrap_distance(s32 distance)
-{
-	return distance & GENMASK(8, 0);
-}
-
-static u32 histb_vdec_avs_scale(u32 numerator, u32 denominator)
-{
-	return numerator * (denominator ? 512 / denominator : 1);
-}
-
-static u32 histb_vdec_avs_direct_scale(u32 denominator)
-{
-	return denominator ? 16384 / denominator : 32;
-}
-
-static u32 histb_vdec_avs_mv_scale(s32 numerator, s32 denominator)
-{
-	return histb_vdec_avs_scale(histb_vdec_avs_wrap_distance(numerator),
-				     histb_vdec_avs_wrap_distance(denominator)) &
-		GENMASK(17, 0);
-}
-
-static void
-histb_vdec_avs_field_direct_config(const struct histb_vdec_avs_reference refs[3],
-				   u32 r0, u32 direct[8])
-{
-	unsigned int k;
-
-	if (histb_vdec_avs_ref_valid(&refs[1])) {
-		for (k = 0; k < 4; k++) {
-			const struct histb_vdec_avs_reference *reference =
-				&refs[1 + k / 2];
-			u32 distance;
-			u32 parity = (k + 1) & 1;
-
-			if (!histb_vdec_avs_ref_valid(reference))
-				continue;
-			distance = 2 * histb_vdec_avs_ref_distance(reference) +
-				   parity;
-			distance = histb_vdec_avs_wrap_distance(r0 - distance);
-			direct[k] = histb_vdec_avs_direct_scale(distance);
-		}
-		memcpy(direct + 4, direct, 4 * sizeof(*direct));
-		return;
-	}
-
-	for (k = 0; k < 4; k++) {
-		const struct histb_vdec_avs_reference *reference =
-			&refs[(k + 1) / 2];
-		u32 distance;
-		u32 parity = k & 1;
-
-		if (!histb_vdec_avs_ref_valid(reference))
-			continue;
-		distance = 2 * histb_vdec_avs_ref_distance(reference) + parity;
-		distance = histb_vdec_avs_wrap_distance(r0 + 1 - distance);
-		direct[k + 4] = histb_vdec_avs_direct_scale(distance);
-	}
-}
-
 static __le32 histb_vdec_pack4(u8 a, u8 b, u8 c, u8 d);
-
-static void
-histb_vdec_avs_pmv_config(const struct histb_vdec_avs_metadata *metadata,
-			  const struct histb_vdec_avs_reference refs[3],
-			  u32 words[32])
-{
-	u32 current_distance = 2 * metadata->picture_distance;
-	u32 idx[8] = { };
-	u32 mv[32] = { };
-	u32 direct[8] = { };
-	u32 bblk[8] = { };
-	u32 sym[4] = { };
-	u32 r0 = 2 * histb_vdec_avs_ref_distance(&refs[0]);
-	u32 r1 = 2 * histb_vdec_avs_ref_distance(&refs[1]);
-	s32 numerator, denominator;
-	unsigned int i, j;
-
-	memset(words, 0, sizeof(u32) * 32);
-	if (metadata->picture_structure == V4L2_AVS_PICTURE_STRUCTURE_FIELD) {
-		unsigned int f, k;
-
-		switch (metadata->picture_coding_type) {
-		case V4L2_AVS_PICTURE_TYPE_I:
-			idx[4] = r0;
-			mv[16] = 512;
-			break;
-		case V4L2_AVS_PICTURE_TYPE_P:
-			if (histb_vdec_avs_ref_valid(&refs[1]))
-				idx[3] = r1;
-			idx[2] = idx[3] + 1;
-			idx[7] = idx[2];
-			idx[1] = r0;
-			idx[6] = idx[1];
-			idx[0] = r0 + 1;
-			idx[5] = idx[0];
-			idx[4] = current_distance;
-			for (f = 0; f < 2; f++)
-				for (i = 0; i < 4; i++)
-					for (j = 0; j < 4; j++) {
-						numerator = current_distance + f -
-							    idx[4 * f + i];
-						denominator = current_distance + f -
-							      idx[4 * f + j];
-						mv[16 * f + 4 * i + j] =
-							histb_vdec_avs_mv_scale(numerator,
-										denominator);
-					}
-			break;
-		case V4L2_AVS_PICTURE_TYPE_B:
-			if (histb_vdec_avs_ref_valid(&refs[1]))
-				idx[1] = r1;
-			idx[0] = idx[1] + 1;
-			idx[4] = idx[0];
-			idx[5] = idx[1];
-			idx[2] = r0;
-			idx[6] = idx[2];
-			idx[3] = r0 + 1;
-			idx[7] = idx[3];
-			for (f = 0; f < 2; f++) {
-				for (i = 0; i < 2; i++)
-					for (j = 0; j < 2; j++) {
-						numerator = current_distance + f -
-							    idx[4 * f + i];
-						denominator = current_distance + f -
-							      idx[4 * f + j];
-						mv[8 * f + 2 * i + j] =
-							histb_vdec_avs_mv_scale(numerator,
-										denominator);
-					}
-				for (i = 2; i < 4; i++)
-					for (j = 2; j < 4; j++) {
-						numerator = idx[4 * f + i] -
-							    (current_distance + f);
-						denominator = idx[4 * f + j] -
-							      (current_distance + f);
-						mv[8 * f + 4 + 2 * (i - 2) + j - 2] =
-							histb_vdec_avs_mv_scale(numerator,
-										denominator);
-					}
-			}
-			histb_vdec_avs_field_direct_config(refs, r0, direct);
-			for (f = 0; f < 2; f++) {
-				u32 picture_distance = current_distance + f;
-
-				for (k = 0; k < 2; k++) {
-					numerator = idx[4 * f + 3 - k] -
-						    picture_distance;
-					denominator = picture_distance - idx[4 * f + k];
-					sym[2 * f + k] =
-						histb_vdec_avs_mv_scale(numerator,
-									denominator);
-				}
-			}
-			bblk[0] = histb_vdec_avs_wrap_distance(current_distance - idx[0]);
-			bblk[1] = histb_vdec_avs_wrap_distance(current_distance - idx[1]);
-			bblk[2] = histb_vdec_avs_wrap_distance(idx[2] - current_distance);
-			bblk[3] = histb_vdec_avs_wrap_distance(idx[3] - current_distance);
-			bblk[4] = histb_vdec_avs_wrap_distance(current_distance + 1 - idx[4]);
-			bblk[5] = histb_vdec_avs_wrap_distance(current_distance + 1 - idx[5]);
-			bblk[6] = histb_vdec_avs_wrap_distance(idx[6] - current_distance - 1);
-			bblk[7] = histb_vdec_avs_wrap_distance(idx[7] - current_distance - 1);
-			break;
-		}
-
-		if (metadata->picture_coding_type != V4L2_AVS_PICTURE_TYPE_B) {
-			memcpy(words, mv, sizeof(mv));
-			return;
-		}
-		for (i = 0; i < 16; i++)
-			words[i] = mv[i];
-		for (i = 0; i < 8; i++)
-			words[16 + i] = direct[i] & GENMASK(14, 0);
-		for (i = 0; i < 4; i++)
-			words[24 + i] = (bblk[2 * i] & GENMASK(8, 0)) |
-				((bblk[2 * i + 1] & GENMASK(8, 0)) << 9);
-		for (i = 0; i < 4; i++)
-			words[28 + i] = sym[i];
-		return;
-	}
-
-	if (metadata->picture_coding_type == V4L2_AVS_PICTURE_TYPE_P) {
-		idx[0] = 2 * histb_vdec_avs_ref_distance(&refs[0]);
-		idx[1] = 2 * histb_vdec_avs_ref_distance(&refs[1]);
-		for (i = 0; i < 2; i++) {
-			for (j = 0; j < 2; j++) {
-				numerator = histb_vdec_avs_wrap_distance(current_distance -
-									 idx[i]);
-				denominator = histb_vdec_avs_wrap_distance(current_distance -
-									   idx[j]);
-				words[4 * i + j] =
-					histb_vdec_avs_scale(numerator, denominator) &
-					GENMASK(17, 0);
-			}
-		}
-		return;
-	}
-	if (metadata->picture_coding_type != V4L2_AVS_PICTURE_TYPE_B)
-		return;
-
-	idx[0] = 2 * histb_vdec_avs_ref_distance(&refs[1]);
-	idx[2] = 2 * histb_vdec_avs_ref_distance(&refs[0]);
-	numerator = histb_vdec_avs_wrap_distance(current_distance - idx[0]);
-	words[0] = histb_vdec_avs_scale(numerator, numerator) & GENMASK(17, 0);
-	numerator = histb_vdec_avs_wrap_distance(idx[2] - current_distance);
-	words[4] = histb_vdec_avs_scale(numerator, numerator) & GENMASK(17, 0);
-	for (i = 0; i < 2; i++) {
-		u32 forward_distance;
-
-		if (!histb_vdec_avs_ref_valid(&refs[i + 1]))
-			continue;
-		forward_distance = 2 * histb_vdec_avs_ref_distance(&refs[i + 1]);
-		denominator = histb_vdec_avs_wrap_distance(idx[2] -
-								    forward_distance);
-		words[16 + i] = histb_vdec_avs_direct_scale(denominator) &
-				GENMASK(14, 0);
-	}
-	words[24] = histb_vdec_avs_wrap_distance(current_distance - idx[0]);
-	words[25] = histb_vdec_avs_wrap_distance(idx[2] - current_distance);
-	if (histb_vdec_avs_ref_valid(&refs[1])) {
-		numerator = histb_vdec_avs_wrap_distance(idx[2] - current_distance);
-		denominator = histb_vdec_avs_wrap_distance(current_distance - idx[0]);
-		words[28] = histb_vdec_avs_scale(numerator, denominator) &
-			GENMASK(17, 0);
-	}
-}
-
-static void
-histb_vdec_write_avs_wq_matrix(__le32 *pic,
-			       const struct v4l2_ctrl_avs_picture *picture)
-{
-	unsigned int row;
-
-	for (row = 0; row < 16; row++)
-		pic[64 + row] = cpu_to_le32(0x80808080);
-	if (!(picture->flags & V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT))
-		return;
-	for (row = 0; row < 8; row++) {
-		const u16 *matrix = &picture->weighting_quant_matrix[row * 8];
-		__le32 even = histb_vdec_pack4(matrix[0], matrix[2], matrix[4],
-						       matrix[6]);
-		__le32 odd = histb_vdec_pack4(matrix[1], matrix[3], matrix[5],
-						      matrix[7]);
-
-		pic[64 + row * 2] = even;
-		pic[65 + row * 2] = odd;
-	}
-}
-
-static int
-histb_vdec_prepare_avs_slice(struct histb_vdec_ctx *ctx,
-			     const struct v4l2_ctrl_avs_slice_params *slice,
-			     const struct histb_vdec_avs_stream *stream,
-			     dma_addr_t src_dma, u32 end_mb,
-			     unsigned int index, unsigned int num_slices)
-{
-	__le32 *msg = histb_vdec_avs_slice_msg(ctx, index);
-	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
-	dma_addr_t stream_base = round_down(src_dma, 16);
-	u64 delta = src_dma + stream->data_offset + 4 - stream_base;
-	u32 bit_offset = (delta & 15) * 8;
-	u32 bytes_pos = delta & ~15U;
-	u32 valid_bits = (stream->size - 4) * 8;
-
-	/*
-	 * The VDH consumes the vertical start-code byte after 00 00 01.  The
-	 * vendor HAL represents an aligned fourth byte through the preceding
-	 * word and a 120-bit offset instead of allowing a zero bit offset.
-	 */
-	if (bit_offset <= 7) {
-		if (bytes_pos < 4)
-			return -ERANGE;
-		bytes_pos -= 4;
-		bit_offset += 120;
-	} else {
-		bit_offset -= 8;
-	}
-	valid_bits += 8;
-	if (delta > U32_MAX || bytes_pos > GENMASK(23, 0) ||
-	    valid_bits > GENMASK(24, 0) || bit_offset > GENMASK(6, 0))
-		return -ERANGE;
-	msg[0] = cpu_to_le32(valid_bits | bit_offset << 25);
-	msg[1] = cpu_to_le32(bytes_pos & GENMASK(23, 4));
-	msg[4] = cpu_to_le32(slice->slice_start_mb | end_mb << 16);
-	if (index + 1 < num_slices)
-		msg[63] = cpu_to_le32(lower_32_bits(msg_dma +
-			HISTB_VDEC_AVS_SLICE_MSG_OFFSET +
-			(index + 1) * HISTB_VDEC_AVS_SLICE_MSG_SIZE));
-	return 0;
-}
-
-static int
-histb_vdec_prepare_avs_messages(struct histb_vdec_ctx *ctx,
-				struct histb_vdec_decoded_buffer *decoded,
-				const struct v4l2_ctrl_avs_sequence *sequence,
-				const struct v4l2_ctrl_avs_picture *picture,
-				const struct v4l2_ctrl_avs_decode_params *decode,
-				const struct v4l2_ctrl_avs_slice_params *slices,
-				unsigned int num_slices, dma_addr_t src_dma,
-				const struct histb_vdec_avs_stream *streams)
-{
-	struct histb_vdec_avs_metadata metadata = {
-		.anchor = picture->picture_coding_type != V4L2_AVS_PICTURE_TYPE_B,
-		.interlaced = !(picture->flags &
-			V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME),
-		.top_field_first = picture->flags &
-			V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST,
-		.picture_structure = picture->picture_structure,
-		.picture_coding_type = picture->picture_coding_type,
-		.picture_distance = picture->picture_distance,
-	};
-	struct histb_vdec_avs_reference refs[3];
-	const struct histb_vdec_avs_reference *backward, *forward0, *forward1;
-	__le32 *pic = histb_vdec_avs_pic_msg(ctx);
-	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
-	dma_addr_t recon, current_pmv, pmv_top, rcn_top, dblk_top, sed_top;
-	u32 pmv[32] = { };
-	u32 width_mbs = DIV_ROUND_UP(sequence->horizontal_size, 16);
-	u32 height_mbs = histb_vdec_avs_height_mbs(sequence->vertical_size,
-							  sequence->flags &
-							  V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE);
-	u32 value;
-	unsigned int i;
-	int ret;
-
-	decoded->error_tainted = false;
-	decoded->avs = metadata;
-	decoded->avs.valid = false;
-	ret = histb_vdec_avs_build_references(ctx, decoded, picture, decode, refs);
-	if (ret)
-		return ret;
-	if (decoded->apc_slot != HISTB_VDEC_APC_INVALID)
-		return -EINVAL;
-	histb_vdec_reclaim_decoded_buffers(ctx, decoded);
-	ret = histb_vdec_alloc_decoded_buffers(ctx, decoded);
-	if (ret)
-		return ret;
-	if (!histb_vdec_avs_decoded_smmu_valid(decoded))
-		return -ERANGE;
-	for (i = 0; i < ARRAY_SIZE(refs); i++)
-		if (histb_vdec_avs_ref_valid(&refs[i]) &&
-		    !histb_vdec_avs_decoded_smmu_valid(refs[i].decoded))
-			return -ERANGE;
-	recon = round_down(decoded->tile.dma, 16);
-	current_pmv = round_down(decoded->pmv.dma, 16);
-	pmv_top = round_down(histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_PMV_TOP),
-			     16);
-	rcn_top = round_down(histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_RCN_TOP),
-			     16);
-	dblk_top = round_down(histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_DBLK_TOP),
-			      16);
-	sed_top = round_down(histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_SED_TOP),
-			     16);
-	memset(ctx->buffers[HISTB_VDEC_BUF_MSG].cpu, 0,
-	       ctx->buffers[HISTB_VDEC_BUF_MSG].size);
-
-	pic[0] = cpu_to_le32((width_mbs - 1) | (height_mbs - 1) << 16 |
-		(sequence->chroma_format & 3) << 25 |
-		(sequence->sample_precision & 3) << 27);
-	value = !!(picture->flags & V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME) |
-		((picture->picture_structure ? 3 : 1) << 1) |
-		(picture->picture_coding_type & 3) << 3 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST) << 5 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD) << 6 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_FIXED_QP) << 7 |
-		(picture->picture_qp & 0x3f) << 8 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_SKIP_MODE) << 14 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_DISABLE) << 15 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_REFERENCE) << 16 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE) << 17;
-	pic[1] = cpu_to_le32(value);
-	value = !!(picture->flags & V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE) |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_PARAMS) << 1 |
-		(picture->alpha_c_offset & 0x1f) << 2 |
-		(picture->beta_offset & 0x1f) << 7;
-	pic[2] = cpu_to_le32(value);
-	backward = &refs[0];
-	if (picture->picture_coding_type == V4L2_AVS_PICTURE_TYPE_B) {
-		forward0 = &refs[1];
-		forward1 = &refs[2];
-	} else {
-		forward0 = &refs[0];
-		forward1 = &refs[1];
-	}
-	pic[3] = cpu_to_le32(histb_vdec_avs_ref_tff(forward0) |
-		histb_vdec_avs_ref_structure(forward0) << 1 |
-		histb_vdec_avs_ref_tff(forward1) << 3 |
-		histb_vdec_avs_ref_structure(forward1) << 4 |
-		histb_vdec_avs_ref_tff(backward) << 6 |
-		histb_vdec_avs_ref_structure(backward) << 7);
-	pic[4] = cpu_to_le32(lower_32_bits(histb_vdec_avs_ref_tile(backward)));
-	pic[5] = cpu_to_le32(lower_32_bits(histb_vdec_avs_ref_tile(forward0)));
-	pic[6] = cpu_to_le32(lower_32_bits(histb_vdec_avs_ref_tile(forward1)));
-	pic[7] = cpu_to_le32(lower_32_bits(recon));
-	value = histb_vdec_avs_ref_structure(&refs[0]) << 24;
-	if (histb_vdec_avs_ref_valid(&refs[0]))
-		value |= !!refs[0].metadata->picture_coding_type;
-	pic[8] = cpu_to_le32(value);
-	value = !!(picture->flags & V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT) |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE) << 1 |
-		(picture->chroma_qp_delta_v & 0x3f) << 2 |
-		(picture->chroma_qp_delta_u & 0x3f) << 8 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_AEC) << 14 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED) << 15 |
-		!!(picture->flags & V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED) << 16;
-	pic[12] = cpu_to_le32(value);
-	pic[13] = cpu_to_le32(lower_32_bits(pmv_top));
-	pic[14] = cpu_to_le32(lower_32_bits(rcn_top));
-	pic[16] = cpu_to_le32(lower_32_bits(histb_vdec_avs_ref_pmv(&refs[0])));
-	histb_vdec_avs_pmv_config(&metadata, refs, pmv);
-	for (i = 0; i < ARRAY_SIZE(pmv); i++)
-		pic[17 + i] = cpu_to_le32(pmv[i]);
-	pic[49] = cpu_to_le32(lower_32_bits(current_pmv));
-	pic[50] = cpu_to_le32(lower_32_bits(dblk_top));
-	pic[51] = cpu_to_le32(lower_32_bits(sed_top));
-	pic[63] = cpu_to_le32(lower_32_bits(msg_dma +
-		HISTB_VDEC_AVS_SLICE_MSG_OFFSET));
-	histb_vdec_write_avs_wq_matrix(pic, picture);
-
-	for (i = 0; i < num_slices; i++) {
-		u32 end_mb = i + 1 < num_slices ?
-			slices[i + 1].slice_start_mb - 1 :
-			width_mbs * height_mbs - 1;
-
-		ret = histb_vdec_prepare_avs_slice(ctx, &slices[i], &streams[i],
-						   src_dma, end_mb, i, num_slices);
-		if (ret)
-			return ret;
-	}
-	if (ctx->vdec->backend->encode_avs_picture) {
-		u32 tail = ctx->bitstream.size -
-			ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat);
-
-		ctx->vdec->backend->encode_avs_picture(pic, num_slices);
-		for (i = 0; i < num_slices; i++)
-			ctx->vdec->backend->encode_avs_slice(
-				histb_vdec_avs_slice_msg(ctx, i), tail);
-	}
-	return 0;
-}
 
 static void
 histb_vdec_write_qmatrix(__le32 *pic,
@@ -6867,16 +6041,25 @@ static int histb_vdec_validate_mpeg2(
 	    picture->picture_coding_type > V4L2_MPEG2_PIC_CODING_TYPE_B ||
 	    picture->intra_dc_precision > 3)
 		return -EINVAL;
-	if (sequence->profile_and_level_indication & BIT(7))
-		return -EOPNOTSUPP;
-	profile = (sequence->profile_and_level_indication >> 4) & 0x7;
-	/* MPEG-1 has profile_and_level_indication == 0; MPEG-2 has profiles 1, 4, 5. */
-	if (sequence->profile_and_level_indication != 0 &&
-	    profile != 1 && profile != 4 && profile != 5)
-		return -EOPNOTSUPP;
-	if (profile == 5 && picture->picture_coding_type ==
-			    V4L2_MPEG2_PIC_CODING_TYPE_B)
-		return -EINVAL;
+	/*
+	 * profile_and_level_indication == 0 means "not provided": FFmpeg's
+	 * v4l2request hwaccel always sends 0 (it has no use for it), and 0 is
+	 * not a legal indication, so it cannot be mistaken for a real profile.
+	 * Rejecting it with -EOPNOTSUPP failed every FFmpeg MPEG-2 request
+	 * ("MG2S request setup failed: -95").  The hardware is not programmed
+	 * from the profile, only from the picture header fields.
+	 */
+	if (sequence->profile_and_level_indication) {
+		if (sequence->profile_and_level_indication & BIT(7))
+			return -EOPNOTSUPP;
+		profile = (sequence->profile_and_level_indication >> 4) & 0x7;
+		/* Only the non-scalable High, Main and Simple profiles are in scope. */
+		if (profile != 1 && profile != 4 && profile != 5)
+			return -EOPNOTSUPP;
+		if (profile == 5 && picture->picture_coding_type ==
+				    V4L2_MPEG2_PIC_CODING_TYPE_B)
+			return -EINVAL;
+	}
 	if (ALIGN(sequence->horizontal_size, 16) !=
 			ALIGN(ctx->src.pix.width, 16) ||
 	    ALIGN(sequence->vertical_size, 16) !=
@@ -6884,22 +6067,10 @@ static int histb_vdec_validate_mpeg2(
 	    ctx->src.pix.width > HISTB_VDEC_MPEG2_MAX_WIDTH ||
 	    ctx->src.pix.height > HISTB_VDEC_MPEG2_MAX_HEIGHT)
 		return -EINVAL;
-	if (sequence->profile_and_level_indication != 0) {
-		for (i = 0; i < sizeof(picture->f_code); i++)
-			if (!((const u8 *)picture->f_code)[i] ||
-			    ((const u8 *)picture->f_code)[i] > 15)
-				return -EINVAL;
-	} else {
-		if (picture->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_P ||
-		    picture->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_B) {
-			if (!picture->f_code[0][0] || picture->f_code[0][0] > 15)
-				return -EINVAL;
-		}
-		if (picture->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_B) {
-			if (!picture->f_code[1][0] || picture->f_code[1][0] > 15)
-				return -EINVAL;
-		}
-	}
+	for (i = 0; i < sizeof(picture->f_code); i++)
+		if (!((const u8 *)picture->f_code)[i] ||
+		    ((const u8 *)picture->f_code)[i] > 15)
+			return -EINVAL;
 	return 0;
 }
 
@@ -7059,7 +6230,12 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	field_pic = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
 	bottom_field = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD;
 
-	/* MVC uses encoded view identity and final Annex-G request lists. */
+	/*
+	 * Baseline, Main and High, plus the two MVC profiles.  The MVC
+	 * front-end is not wired in yet, so accepting 118 and 128 only means
+	 * the parameters reach the same validation a non-MVC picture gets;
+	 * the multivew extension itself is still parsed and discarded.
+	 */
 	if ((sps->profile_idc != 66 && sps->profile_idc != 77 &&
 	     sps->profile_idc != 100 && sps->profile_idc != 118 &&
 	     sps->profile_idc != 128) ||
@@ -7574,6 +6750,53 @@ static void histb_vdec_write_hevc_tile_info(
 	}
 }
 
+/*
+ * bit_size / data_byte_offset of HEVC_SLICE_PARAMS have two incompatible
+ * readings in the wild, and the driver below is written for the first:
+ *
+ *  - "whole NAL" (GStreamer v4l2codecs): bit_size covers the whole slice
+ *    NAL unit, data_byte_offset is the offset of the slice data inside THAT
+ *    NAL.  The NALs are back to back in the OUTPUT buffer, so
+ *    sum(DIV_ROUND_UP(bit_size, 8)) == payload.
+ *  - "data only" (FFmpeg v4l2request, Kwiboo): bit_size covers only the slice
+ *    data (header excluded) and data_byte_offset is ABSOLUTE in the OUTPUT
+ *    buffer, so the NAL ends at data_byte_offset + DIV_ROUND_UP(bit_size, 8).
+ *    That sum is exact for every slice, which makes the NAL boundaries
+ *    recoverable without scanning the stream.
+ *
+ * Convert the second form to the first, in a copy.  Without this every FFmpeg
+ * HEVC request fails the "NALs add up to the payload" check (or, with one
+ * slice, decodes the wrong span) and the frame comes out as noise or flat.
+ */
+static int histb_vdec_hevc_normalize_slices(
+		const struct v4l2_ctrl_hevc_slice_params *in,
+		unsigned int num_slices, unsigned long payload,
+		struct v4l2_ctrl_hevc_slice_params *out)
+{
+	u64 whole = 0, pos = 0;
+	unsigned int i;
+
+	memcpy(out, in, num_slices * sizeof(*out));
+	for (i = 0; i < num_slices; i++)
+		whole += DIV_ROUND_UP(in[i].bit_size, 8);
+	if (whole == payload)
+		return 0;
+
+	for (i = 0; i < num_slices; i++) {
+		u64 end = (u64)in[i].data_byte_offset +
+			  DIV_ROUND_UP(in[i].bit_size, 8);
+
+		if (in[i].data_byte_offset <= pos || end <= in[i].data_byte_offset ||
+		    end > payload)
+			return -EINVAL;
+		out[i].bit_size = (end - pos) * 8;
+		out[i].data_byte_offset = in[i].data_byte_offset - pos;
+		pos = end;
+	}
+
+	return pos == payload ? 0 : -EINVAL;
+}
+
 static int histb_vdec_validate_hevc_frame(
 			struct histb_vdec_ctx *ctx,
 		const struct v4l2_ctrl_hevc_decode_params *decode,
@@ -7590,8 +6813,7 @@ static int histb_vdec_validate_hevc_frame(
 	unsigned int entry_offset = 0;
 	unsigned int i;
 
-	if (!decode || !sps || !pps || !slices ||
-	    !num_slices || num_slices > HISTB_VDEC_HEVC_MAX_SLICES ||
+	if (!num_slices || num_slices > HISTB_VDEC_HEVC_MAX_SLICES ||
 	    slices[0].slice_segment_addr ||
 	    (slices[0].flags &
 	     V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT))
@@ -7599,9 +6821,6 @@ static int histb_vdec_validate_hevc_frame(
 	min_cb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3;
 	ctb_log2 = min_cb_log2 +
 		sps->log2_diff_max_min_luma_coding_block_size;
-	/* Validate before BIT() and the following rounded divisions. */
-	if (ctb_log2 < 4 || ctb_log2 > 6)
-		return -EINVAL;
 	ctb_width = DIV_ROUND_UP(sps->pic_width_in_luma_samples, BIT(ctb_log2));
 	ctb_height = DIV_ROUND_UP(sps->pic_height_in_luma_samples, BIT(ctb_log2));
 	if (histb_vdec_hevc_init_tiles(pps, ctb_width, ctb_height, &tiles))
@@ -7736,7 +6955,6 @@ static int histb_vdec_prepare_hevc_slice(
 	__le32 *slice_msg = histb_vdec_hevc_msg_slot(msg_base,
 		HISTB_VDEC_SLICE_MSG_SLOT + slice_index);
 	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
-	dma_addr_t mv_addr = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_COLMB);
 	dma_addr_t stream = src_dma + stream_info->data_offset;
 	bool pframe = slice->slice_type == V4L2_HEVC_SLICE_TYPE_P;
 	bool bframe = slice->slice_type == V4L2_HEVC_SLICE_TYPE_B;
@@ -7750,8 +6968,8 @@ static int histb_vdec_prepare_hevc_slice(
 	u32 value;
 	unsigned int i;
 
-	temporal_mvp = (pframe || bframe) && (slice->flags &
-		V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED);
+	temporal_mvp = slice->flags &
+		V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED;
 
 	slice_msg[0] = cpu_to_le32(lower_32_bits(round_down(stream, 16) -
 						   round_down(src_dma, 16)));
@@ -7795,26 +7013,22 @@ static int histb_vdec_prepare_hevc_slice(
 		slice_msg[17 + i / 8] |= cpu_to_le32((u32)slot <<
 								 (4 * (i % 8)));
 	}
-
-	/* V4R3 word 6: low-delay, dependent, QP, CABAC init and address. */
 	slice_msg[6] = cpu_to_le32((low_delay ? BIT(27) : 0) |
 		(!!(slice->flags &
 		    V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) << 26) |
 		((qp & 0x7f) << 19) |
 		(!!(slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT) << 18) |
 		independent_addr);
-	/* CV200 PMV encodes syntax B/P/I as hardware 2/1/0. */
-	value = 2 - slice->slice_type;
-	if (pframe || bframe)
-		value |= (5 - slice->five_minus_max_num_merge_cand) << 24;
+	value = (5 - slice->five_minus_max_num_merge_cand) << 24;
 	if (pframe || bframe)
 		value |= ((references_l1 ? references_l1 - 1 : 0) << 20) |
 			 ((references_l0 - 1) << 16) |
 			 (references_l1 << 8) | (references_l0 << 2) |
+			 (bframe ? 2 : 1) |
 			 (!!(slice->flags &
 			     V4L2_HEVC_SLICE_PARAMS_FLAG_MVD_L1_ZERO) << 14) |
 			 (temporal_mvp << 15);
-	if (temporal_mvp) {
+	if (temporal_mvp && (pframe || bframe)) {
 		unsigned int colocated_idx = slice->collocated_ref_idx;
 		unsigned int colocated_dpb;
 		struct histb_vdec_decoded_buffer *ref;
@@ -7838,20 +7052,29 @@ static int histb_vdec_prepare_hevc_slice(
 		if (!ref || !histb_vdec_decoded_buffer_valid(ref))
 			return -EINVAL;
 		histb_vdec_propagate_error_taint(decoded, ref);
-		mv_addr = ref->pmv.dma;
-		value |= ((u32)slot << 28) | (colocated_l0 << 27);
+		value |= ((u32)(bframe ? slot : 0) << 28) |
+			 (colocated_l0 << 27);
+		slice_msg[23] = cpu_to_le32(lower_32_bits(ref->pmv.dma));
+	} else if (temporal_mvp) {
+		struct histb_vdec_decoded_buffer *ref = ctx->apc[0];
+
+		if (!ref || !histb_vdec_decoded_buffer_valid(ref))
+			return -EINVAL;
+		histb_vdec_propagate_error_taint(decoded, ref);
+		slice_msg[23] = cpu_to_le32(lower_32_bits(ref->pmv.dma));
+	} else {
+		slice_msg[23] = cpu_to_le32(lower_32_bits(
+			histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_COLMB)));
 	}
-	slice_msg[23] = cpu_to_le32(lower_32_bits(mv_addr));
-	slice_msg[24] = cpu_to_le32(0x400a |
-				   ((3 * sps->bit_depth_luma_minus8) << 8));
 	slice_msg[7] = cpu_to_le32(value);
 	slice_msg[8] = cpu_to_le32(slice->slice_segment_addr);
-	slice_msg[9] = cpu_to_le32((slice->slice_segment_addr / ctb_width) << 16 |
-						 (slice->slice_segment_addr % ctb_width));
+	slice_msg[9] = cpu_to_le32(
+		(slice->slice_segment_addr / ctb_width) << 16 |
+		(slice->slice_segment_addr % ctb_width));
 	slice_msg[10] = cpu_to_le32(histb_vdec_hevc_rs_to_ts(
 		tiles, ctb_width, slice->slice_segment_addr));
 	slice_msg[11] = cpu_to_le32((slice->slice_cb_qp_offset & 0x1f) << 8 |
-						  (slice->slice_cr_qp_offset & 0x1f));
+				      (slice->slice_cr_qp_offset & 0x1f));
 	value = ((slice->slice_tc_offset_div2 & 0xf) << 16) |
 		((slice->slice_beta_offset_div2 & 0xf) << 8) |
 		(!!(slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_LUMA) << 3) |
@@ -7861,6 +7084,8 @@ static int histb_vdec_prepare_hevc_slice(
 		!!(slice->flags &
 		   V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED);
 	slice_msg[12] = cpu_to_le32(value);
+	slice_msg[24] = cpu_to_le32(0x400a |
+		((3 * sps->bit_depth_luma_minus8) << 8));
 	slice_msg[43] = cpu_to_le32(ctb_end_rs);
 	slice_msg[44] = cpu_to_le32(ctb_end_ts);
 	if (slice_index + 1 < num_slices)
@@ -7918,8 +7143,8 @@ histb_vdec_prepare_hevc_messages(
 				      BIT(ctb_log2));
 	u32 ctb_end_ts = ctb_width * ctb_height - 1;
 	struct histb_vdec_hevc_tiles tiles;
-	u32 independent_addr = 0;
 	s8 dpb_to_apc[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
+	u32 independent_addr = 0;
 	u32 value, i;
 	int ret;
 
@@ -7966,12 +7191,17 @@ histb_vdec_prepare_hevc_messages(
 			ret, ctx->dst.pix.width, ctx->dst.pix.height);
 		return ret;
 	}
-	/* Only the report, picture and active slice slots belong to this request. */
+	/* Only these message slots participate in this request.  The HEVC
+	 * buffer is sized for 200 slices, so clearing it in full on an ordinary
+	 * one-slice frame needlessly writes roughly 260 KiB through an uncached
+	 * coherent mapping. */
 	memset(histb_vdec_hevc_msg_slot(msg_base, HISTB_VDEC_UP_MSG_SLOT), 0,
 	       HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
 	memset(pic, 0, HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
 	memset(histb_vdec_hevc_msg_slot(msg_base, HISTB_VDEC_SLICE_MSG_SLOT), 0,
 	       num_slices * HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
+	memset(ctx->buffers[HISTB_VDEC_BUF_APC_MV].cpu, 0,
+	       V4L2_HEVC_DPB_ENTRIES_NUM_MAX * sizeof(__le32));
 	histb_vdec_write_hevc_tile_info(ctx, &tiles, ctb_log2);
 	value = (!!(sps->flags &
 		    V4L2_HEVC_SPS_FLAG_STRONG_INTRA_SMOOTHING_ENABLED) << 25) |
@@ -8009,13 +7239,13 @@ histb_vdec_prepare_hevc_messages(
 	pic[6] = cpu_to_le32(lower_32_bits(decoded->pmv.dma));
 	pic[7] = cpu_to_le32(lower_32_bits(histb_vdec_buffer_dma(ctx,
 								 HISTB_VDEC_BUF_RCN_TOP)));
-	for (i = 0; i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
+	for (i = 0; i < ARRAY_SIZE(ctx->apc); i++) {
 		struct histb_vdec_decoded_buffer *ref = ctx->apc[i];
 		dma_addr_t ref_dma;
 		unsigned int first_valid;
 
 		if (!ref) {
-			for (first_valid = 0; first_valid < V4L2_HEVC_DPB_ENTRIES_NUM_MAX;
+			for (first_valid = 0; first_valid < ARRAY_SIZE(ctx->apc);
 			     first_valid++)
 				if (ctx->apc[first_valid]) {
 					ref = ctx->apc[first_valid];
@@ -8083,28 +7313,20 @@ histb_vdec_prepare_hevc_messages(
 		if (!(slices[i].flags &
 		      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT))
 			independent_addr = slices[i].slice_segment_addr;
-		ret = histb_vdec_prepare_hevc_slice(ctx, msg_base, decoded,
-			decode, sps, pps, &slices[i], dpb_to_apc, src_dma,
-			&streams[i], &tiles, ctb_width, end_rs, end_ts,
-			independent_addr, i, num_slices);
+		ret = histb_vdec_prepare_hevc_slice(ctx, msg_base, decoded, decode, sps, pps,
+						    &slices[i], dpb_to_apc, src_dma, &streams[i],
+			&tiles, ctb_width, end_rs, end_ts, independent_addr,
+			i, num_slices);
 		if (ret) {
 			dev_err_ratelimited(ctx->vdec->dev,
 				"HEVC slice setup failed: ret=%d index=%u type=%u refs=%u/%u temporal_mvp=%u poc=%d\n",
 				ret, i, slices[i].slice_type,
 				slices[i].num_ref_idx_l0_active_minus1 + 1,
 				slices[i].num_ref_idx_l1_active_minus1 + 1,
-				!!(slices[i].flags &
-				   V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED),
+				!!(slices[i].flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED),
 				slices[i].slice_pic_order_cnt);
 			return ret;
 		}
-	}
-	if (ctx->vdec->backend->encode_hevc_picture) {
-		ctx->vdec->backend->encode_hevc_picture(pic);
-		for (i = 0; i < num_slices; i++)
-			ctx->vdec->backend->encode_hevc_slice(
-				histb_vdec_hevc_msg_slot(msg_base,
-						  HISTB_VDEC_SLICE_MSG_SLOT + i));
 	}
 	/* The VDH consumes the coherent message allocation.  Keep the expensive
 	 * construction cacheable and publish only the active HEVC slots. */
@@ -8112,8 +7334,8 @@ histb_vdec_prepare_hevc_messages(
 		       HISTB_VDEC_HEVC_MSG_SLOT_SIZE,
 	       (u8 *)msg_base + HISTB_VDEC_UP_MSG_SLOT *
 		       HISTB_VDEC_HEVC_MSG_SLOT_SIZE,
-		(HISTB_VDEC_SLICE_MSG_SLOT + num_slices) *
-		HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
+	       (HISTB_VDEC_SLICE_MSG_SLOT + num_slices) *
+	       HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
 	return 0;
 }
 
@@ -8170,11 +7392,6 @@ static int histb_vdec_prepare_mpeg2_messages(
 						   decoded->tile.size,
 						   DMA_BIDIRECTIONAL);
 			decoded->tile.cpu_owned = false;
-			if (decoded->pmv_noncoherent)
-				dma_sync_single_for_cpu(ctx->vdec->dev,
-						decoded->pmv.dma,
-						decoded->pmv.size,
-						DMA_BIDIRECTIONAL);
 			memset(decoded->pmv.cpu, 0, decoded->pmv.size);
 		}
 	} else if (!decoded->tile.cpu || !decoded->pmv.cpu) {
@@ -8238,11 +7455,6 @@ static int histb_vdec_prepare_mpeg2_messages(
 			msg[7] = cpu_to_le32(lower_32_bits(msg_dma +
 				HISTB_VDEC_MPEG2_SLICE_MSG_OFFSET +
 				(i + 1) * HISTB_VDEC_MPEG2_SLICE_MSG_SIZE));
-	}
-	if (ctx->vdec->backend->encode_mpeg2_picture) {
-		ctx->vdec->backend->encode_mpeg2_picture(pic);
-		for (i = 0; i < num_slices; i++)
-			ctx->vdec->backend->encode_mpeg2_slice(slice_msg + i * 8);
 	}
 
 	return 0;
@@ -8510,8 +7722,7 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 			    dma_addr_t stream_base_dma, dma_addr_t src_dma,
 			    unsigned long payload, u32 tail_bits,
 			    unsigned int slice_index, bool new_picture,
-			    bool new_surface,
-			    const struct histb_mvc_slice_identity *identity, u64 timestamp)
+			    bool new_surface)
 {
 	__le32 *pic = histb_vdec_msg_slot(ctx, HISTB_VDEC_PIC_MSG_SLOT);
 	__le32 *slice_msg = histb_vdec_msg_slot(
@@ -8551,7 +7762,7 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 	bool sps_mbaff = sps->flags &
 		V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
 	bool mbaff = !field_pic && sps_mbaff;
-	s8 dpb_to_apc[HISTB_VDEC_H264_DPB_MAP_SIZE];
+	s8 dpb_to_apc[HISTB_VDEC_H264_DPB_SIZE];
 	unsigned int i, references_l0 = 0, references_l1 = 0;
 
 	picture_height = field_pic ? map_height : frame_height;
@@ -8602,14 +7813,12 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 		}
 	}
 	if (histb_vdec_sync_apc(ctx, decoded, decode, dpb_to_apc)) {
-		if (!ctx->mvc_ingress.subset.is_valid)
-			histb_vdec_reset_apc(ctx);
+		histb_vdec_reset_apc(ctx);
 		return -EINVAL;
 	}
 	if (!histb_vdec_h264_current_apc_valid(ctx, decoded, decode,
 						    dpb_to_apc)) {
-		if (!ctx->mvc_ingress.subset.is_valid)
-			histb_vdec_reset_apc(ctx);
+		histb_vdec_reset_apc(ctx);
 		return -EINVAL;
 	}
 	if (new_picture && new_surface) {
@@ -8630,42 +7839,10 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 						   decoded->tile.size,
 						   DMA_BIDIRECTIONAL);
 			decoded->tile.cpu_owned = false;
-			if (decoded->pmv_noncoherent)
-				dma_sync_single_for_cpu(ctx->vdec->dev,
-						decoded->pmv.dma,
-						decoded->pmv.size,
-						DMA_BIDIRECTIONAL);
 			memset(decoded->pmv.cpu, 0, decoded->pmv.size);
 		}
 	} else if (!decoded->tile.cpu || !decoded->pmv.cpu) {
 		return -EINVAL;
-	}
-	if (ctx->mvc_ingress.subset.is_valid) {
-		int ret;
-		unsigned int slot;
-
-		mutex_lock(&ctx->mvc_lock);
-		if (new_picture) {
-			for (slot = 0; slot < ARRAY_SIZE(ctx->apc); slot++)
-				if (!ctx->apc[slot])
-					break;
-			if (slot == ARRAY_SIZE(ctx->apc)) {
-				mutex_unlock(&ctx->mvc_lock);
-				return -ENOSPC;
-			}
-			ret = histb_mvc_ingress_begin(&ctx->mvc_ingress, identity,
-				sps, pps, decode, slice, decoded, timestamp, slot);
-			if (ret >= 0) {
-				ctx->apc[slot] = decoded;
-				decoded->apc_slot = slot;
-			}
-		} else {
-			ret = histb_mvc_ingress_slice(&ctx->mvc_ingress, identity,
-						    decode, slice);
-		}
-		mutex_unlock(&ctx->mvc_lock);
-		if (ret < 0)
-			return ret;
 	}
 	current_pmv = decoded->pmv.dma;
 	if (field_pic && bottom_field)
@@ -8673,6 +7850,21 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 	recon = decoded->tile.dma;
 	if (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
 		header_bits = ALIGN(header_bits, 8);
+	/*
+	 * header_bit_size is an RBSP position (GStreamer subtracts the EPBs it
+	 * met in the header).  Align first, then move to the EBSP: an EPB right
+	 * after the last header byte must not be skipped twice.
+	 */
+	if (ctx->h264_raw && header_bits >= 0) {
+		const u8 *nal = (const u8 *)ctx->bitstream.cpu +
+			(src_dma - ctx->bitstream.dma);
+		u64 ebsp_bits;
+
+		if (!histb_vdec_rbsp_to_ebsp_bits(nal, payload, header_bits,
+						  &ebsp_bits))
+			return -EINVAL;
+		header_bits = ebsp_bits;
+	}
 	if (pframe || bframe)
 		references_l0 = slice->num_ref_idx_l0_active_minus1 + 1;
 	if (bframe)
@@ -8687,6 +7879,24 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 	valid_bits -= tail_bits;
 	if (valid_bits > U32_MAX)
 		return -EOVERFLOW;
+	if (slice_index < HISTB_VDEC_H264_DIAG_SLICES) {
+		struct histb_vdec_h264_diag *diag = &ctx->h264_diag[slice_index];
+		const u8 *data = (const u8 *)ctx->bitstream.cpu +
+			(bytes_pos - ctx->bitstream.dma);
+
+		diag->picture = ctx->h264_pictures;
+		diag->fed_bytes = payload;
+		diag->header_bit_size = slice->header_bit_size;
+		diag->header_bits = header_bits;
+		diag->valid_bits = valid_bits;
+		diag->tail_bits = tail_bits;
+		diag->first_mb = slice->first_mb_in_slice;
+		diag->slice_type = slice->slice_type;
+		memset(diag->head, 0, sizeof(diag->head));
+		memcpy(diag->head, data,
+		       min_t(size_t, sizeof(diag->head),
+			     payload - header_bits / 8));
+	}
 	if (new_picture)
 		memset(ctx->buffers[HISTB_VDEC_BUF_MSG].cpu, 0,
 		       ctx->buffers[HISTB_VDEC_BUF_MSG].size);
@@ -8753,8 +7963,6 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 	histb_vdec_write_qmatrix(pic, scaling,
 				 pps->flags &
 				 V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT);
-	if (ctx->vdec->backend->encode_h264_picture)
-		ctx->vdec->backend->encode_h264_picture(pic, new_picture);
 	if (new_picture) {
 		memcpy(ctx->h264_picture_message, pic,
 		       sizeof(ctx->h264_picture_message));
@@ -8787,31 +7995,23 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 			   bframe ? HISTB_VDEC_SLICE_TYPE_B :
 			   pframe ? HISTB_VDEC_SLICE_TYPE_P :
 			   HISTB_VDEC_SLICE_TYPE_I);
-	{
-		u32 l0_size = references_l0;
-		u32 l1_size = references_l1;
-		value = FIELD_PREP(HISTB_VDEC_SLICE_HW_TYPE,
-				   bframe ? HISTB_VDEC_SLICE_TYPE_B :
-				   pframe ? HISTB_VDEC_SLICE_TYPE_P :
-				   HISTB_VDEC_SLICE_TYPE_I);
-		if (pframe || bframe) {
-			value |= FIELD_PREP(HISTB_VDEC_SLICE_LIST0_SIZE,
-					    l0_size) |
-				 FIELD_PREP(HISTB_VDEC_SLICE_LIST0_ACTIVE,
-					    l0_size ? l0_size - 1 : 0);
-		}
-		if (bframe) {
-			value |= FIELD_PREP(HISTB_VDEC_SLICE_LIST1_SIZE,
-					    l1_size) |
-				 FIELD_PREP(HISTB_VDEC_SLICE_LIST1_ACTIVE,
-					    l1_size ? l1_size - 1 : 0);
-			if (slice->flags & V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED)
-				value |= HISTB_VDEC_SLICE_DIRECT_SPATIAL;
-		}
-		if (sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE)
-			value |= HISTB_VDEC_SLICE_DIRECT_8X8;
-		slice_msg[7] = cpu_to_le32(value);
+	if (pframe || bframe) {
+		value |= FIELD_PREP(HISTB_VDEC_SLICE_LIST0_SIZE,
+				    references_l0) |
+			 FIELD_PREP(HISTB_VDEC_SLICE_LIST0_ACTIVE,
+				    slice->num_ref_idx_l0_active_minus1);
 	}
+	if (bframe) {
+		value |= FIELD_PREP(HISTB_VDEC_SLICE_LIST1_SIZE,
+				    references_l1) |
+			 FIELD_PREP(HISTB_VDEC_SLICE_LIST1_ACTIVE,
+				    slice->num_ref_idx_l1_active_minus1);
+		if (slice->flags & V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED)
+			value |= HISTB_VDEC_SLICE_DIRECT_SPATIAL;
+	}
+	if (sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE)
+		value |= HISTB_VDEC_SLICE_DIRECT_8X8;
+	slice_msg[7] = cpu_to_le32(value);
 	for (i = 0; i < references_l0; i++) {
 		const struct v4l2_h264_reference *reference =
 			&slice->ref_pic_list0[i];
@@ -8872,7 +8072,6 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 		u8 dpb = reference->index;
 		s8 slot = dpb_to_apc[dpb];
 		struct histb_vdec_decoded_buffer *colocated;
-		struct histb_vdec_dma_buffer *colocated_store;
 		dma_addr_t colocated_pmv;
 
 		if (slot < 0)
@@ -8880,47 +8079,18 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 		colocated = ctx->apc[slot];
 		if (!colocated || !histb_vdec_decoded_buffer_valid(colocated))
 			return -EINVAL;
-		colocated_store = &colocated->pmv;
-		if ((ctx->vdec->backend->caps & HISTB_VDEC_BACKEND_MVC) &&
-		    ctx->mvc_ingress.subset.is_valid) {
-			unsigned int surface;
-			bool interview = false;
-			int ret;
-
-			mutex_lock(&ctx->mvc_lock);
-			for (surface = 0;
-			     surface < ARRAY_SIZE(ctx->mvc_ingress.surface); surface++) {
-				const struct histb_mvc_surface *ref =
-					&ctx->mvc_ingress.surface[surface];
-
-				if (ref->buffer != colocated)
-					continue;
-				interview = ref->view_index !=
-					ctx->mvc_ingress.picture.view.voidx;
-				break;
-			}
-			mutex_unlock(&ctx->mvc_lock);
-			if (surface == ARRAY_SIZE(ctx->mvc_ingress.surface))
-				return -EINVAL;
-			if (interview) {
-				ret = histb_vdec_alloc_mvc_pmv(ctx, decoded->pmv.size);
-				if (ret)
-					return ret;
-				colocated_store = &ctx->mvc_pmv;
-			}
-		}
-		colocated_pmv = round_down(colocated_store->dma, 16);
+		colocated_pmv = round_down(colocated->pmv.dma, 16);
 		if (field_pic &&
 		    (entry->flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD) &&
 		    reference->fields == V4L2_H264_BOTTOM_FIELD_REF)
-			colocated_pmv += colocated_store->size / 2;
+			colocated_pmv += colocated->pmv.size / 2;
 		slice_msg[8] = cpu_to_le32(lower_32_bits(colocated_pmv));
 		if (!field_pic &&
 		    (entry->flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD) &&
 		    entry->fields == V4L2_H264_FRAME_REF)
 			slice_msg[9] = cpu_to_le32(lower_32_bits(
-				round_down(colocated_store->dma, 16) +
-				colocated_store->size / 2));
+				round_down(colocated->pmv.dma, 16) +
+				colocated->pmv.size / 2));
 	}
 	for (i = 0; i < ARRAY_SIZE(ctx->apc); i++) {
 		unsigned int polarity;
@@ -8981,12 +8151,9 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 			ctx, HISTB_VDEC_SLICE_MSG_SLOT + slice_index - 1);
 
 		previous[44] = cpu_to_le32(slice->first_mb_in_slice - 1);
-		previous[63] = cpu_to_le32(lower_32_bits(ctx->vdec->backend->start ?
-					       slice_dma >> 4 : slice_dma));
+		previous[63] = cpu_to_le32(lower_32_bits(slice_dma));
 	}
 	slice_msg[63] = 0;
-	if (ctx->vdec->backend->encode_h264_slice)
-		ctx->vdec->backend->encode_h264_slice(slice_msg);
 
 	return 0;
 }
@@ -9089,20 +8256,15 @@ static int histb_vdec_switch_job_phase(struct histb_vdec_dev *vdec,
 	return ret;
 }
 
-static int histb_vdec_cv200_reset_bpd(struct histb_vdec_dev *vdec)
-{
-	return histb_vdec_pulse_crg_reset(vdec, HISTB_CRG_BPD_CLOCK,
-					  HISTB_CRG_BPD_RESET,
-					  HISTB_CRG_BPD_RESET_OK, 0, 0);
-}
-
 static int histb_vdec_reset_vc1_bpd(struct histb_vdec_dev *vdec)
 {
 	void __iomem *bpd = vdec->regs + HISTB_VC1_BPD_OFFSET;
 	int ret;
 
 	writel(0, bpd + HISTB_VC1_BPD_START);
-	ret = vdec->backend->reset_bpd(vdec);
+	ret = histb_vdec_pulse_crg_reset(vdec, HISTB_CRG_BPD_CLOCK,
+					 HISTB_CRG_BPD_RESET,
+					 HISTB_CRG_BPD_RESET_OK, 0, 0);
 	if (ret)
 		return ret;
 
@@ -9120,7 +8282,6 @@ static int histb_vdec_run_vc1_bpd(struct histb_vdec_ctx *ctx,
 				  struct histb_vc1_bpd_result *result)
 {
 	struct histb_vdec_dev *vdec = ctx->vdec;
-	struct histb_vc1_bpd_regs encoded;
 	void __iomem *bpd = vdec->regs + HISTB_VC1_BPD_OFFSET;
 	u64 start_ns;
 	u32 out0, out1, state;
@@ -9129,11 +8290,6 @@ static int histb_vdec_run_vc1_bpd(struct histb_vdec_ctx *ctx,
 
 	if (!regs || !available_bits || !result)
 		return -EINVAL;
-	if (vdec->mv310) {
-		encoded = *regs;
-		histb_vc1_encode_v5r6_bpd_regs(&encoded);
-		regs = &encoded;
-	}
 	mutex_lock(&vdec->launch_lock);
 	if (!histb_vdec_job_in_phase(vdec, ctx, HISTB_VDEC_PHASE_BPD)) {
 		mutex_unlock(&vdec->launch_lock);
@@ -9174,7 +8330,7 @@ static int histb_vdec_run_vc1_bpd(struct histb_vdec_ctx *ctx,
 			break;
 		}
 		if (ktime_get_ns() - start_ns >=
-		    HISTB_VDEC_VC1_BPD_TIMEOUT_MS * NSEC_PER_MSEC) {
+		    (u64)HISTB_VDEC_VC1_BPD_TIMEOUT_MS * NSEC_PER_MSEC) {
 			ret = -ETIMEDOUT;
 			break;
 		}
@@ -9193,7 +8349,7 @@ static int histb_vdec_run_vc1_bpd(struct histb_vdec_ctx *ctx,
 	return ret;
 }
 
-static int histb_vdec_cv200_reset_engine(struct histb_vdec_dev *vdec)
+static int histb_vdec_reset_engine(struct histb_vdec_dev *vdec)
 {
 	u32 scd_int_mask;
 	int err, ret = 0;
@@ -9201,7 +8357,7 @@ static int histb_vdec_cv200_reset_engine(struct histb_vdec_dev *vdec)
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(0, vdec->regs + HISTB_VDEC_START);
 	/* Return the SMMU control register to its baseline before reset. */
-	histb_vdec_program_smmu(vdec, false);
+	histb_vdec_smmu_bypass(vdec);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_MASK_NS);
 	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_S);
@@ -9252,46 +8408,11 @@ static int histb_vdec_cv200_reset_engine(struct histb_vdec_dev *vdec)
 	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_MASK_NS);
 	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_S);
 	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_NS);
-	vdec->avsp_loaded = false;
 	if (ret)
 		dev_err(vdec->dev, "failed to reset decoder pipeline: %d\n", ret);
 
 	return ret;
 }
-static int histb_vdec_reset_engine(struct histb_vdec_dev *vdec)
-{
-	return vdec->backend->reset_engine(vdec);
-}
-
-
-static int histb_vdec_cv200_reset_vdh_domain(struct histb_vdec_dev *vdec)
-{
-	int ret;
-
-	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
-	writel(0, vdec->regs + HISTB_VDEC_START);
-	histb_vdec_program_smmu(vdec, false);
-	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
-	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_MASK_NS);
-	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_S);
-	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_NS);
-
-	ret = histb_vdec_pulse_crg_reset(vdec, HISTB_CRG_VDH_CLOCK,
-					 HISTB_CRG_VDH_RESET,
-					 HISTB_CRG_VDH_RESET_OK,
-					 HISTB_CRG_VDH_CLK_SEL,
-					 FIELD_PREP(HISTB_CRG_VDH_CLK_SEL, 2));
-	if (!ret)
-		ret = histb_vdec_configure_vdh_clock(vdec);
-	vdec->avsp_loaded = false;
-
-	return ret;
-}
-static int histb_vdec_reset_vdh_domain(struct histb_vdec_dev *vdec)
-{
-	return vdec->backend->reset_vdh(vdec);
-}
-
 
 static void histb_vdec_fill_capture_buffer(struct histb_vdec_ctx *ctx,
 					   struct vb2_v4l2_buffer *src,
@@ -9374,6 +8495,9 @@ static int histb_vdec_begin_h264_picture(
 		histb_vdec_reset_h264_field_pair(ctx);
 	}
 
+	ctx->deint_interlaced = !(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY);
+	ctx->deint_tff = field_pic ? (second_field ? bottom_field : !bottom_field) :
+		decode->top_field_order_cnt <= decode->bottom_field_order_cnt;
 	ctx->h264_field_picture = field_pic;
 	ctx->h264_bottom_field = bottom_field;
 	ctx->h264_second_field = second_field;
@@ -9944,29 +9068,6 @@ static void histb_vdec_finish_vc1_error(struct histb_vdec_ctx *ctx)
 	histb_vdec_finish_vc1_error_no_pm(ctx);
 }
 
-static void histb_vdec_finish_mvc(struct histb_vdec_ctx *ctx,
-		struct histb_vdec_decoded_buffer *decoded, bool success, bool drain)
-{
-	struct histb_mvc_ingress *in = &ctx->mvc_ingress;
-	int view = -1;
-
-	mutex_lock(&ctx->mvc_lock);
-	if (in->active >= 0) {
-		view = in->surface[in->active].view_index;
-		histb_mvc_ingress_complete(in, success);
-		if (success)
-			histb_mvc_ingress_output(in, view);
-		else if (decoded->apc_slot >= 0 &&
-			 ctx->apc[decoded->apc_slot] == decoded) {
-			ctx->apc[decoded->apc_slot] = NULL;
-			decoded->apc_slot = HISTB_VDEC_APC_INVALID;
-		}
-	}
-	if (drain && in->subset.is_valid)
-		histb_mvc_ingress_drain(in);
-	mutex_unlock(&ctx->mvc_lock);
-}
-
 static void histb_vdec_finish_job_no_pm(struct histb_vdec_ctx *ctx,
 					enum vb2_buffer_state state)
 {
@@ -9994,17 +9095,12 @@ static void histb_vdec_finish_job_no_pm(struct histb_vdec_ctx *ctx,
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE) {
 		src->flags &= ~V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
 		histb_vdec_reset_h264_slices(ctx);
-		if (!ctx->mvc_ingress.subset.is_valid)
-			histb_vdec_reset_apc(ctx);
+		histb_vdec_reset_apc(ctx);
 	}
 
 	histb_vdec_prepare_capture_buffer(ctx, src, dst, decode_state,
 					  ctx->frame_flags);
 	decoded = histb_vdec_decoded_buffer(dst);
-	if (ctx->mvc_ingress.subset.is_valid)
-		histb_vdec_finish_mvc(ctx, decoded,
-			decode_state == VB2_BUF_STATE_DONE && !decoded->error_tainted,
-			draining);
 	if (decode_state != VB2_BUF_STATE_DONE)
 		decoded->error_tainted = true;
 	if (mpeg2_commit_reference &&
@@ -10017,8 +9113,6 @@ static void histb_vdec_finish_job_no_pm(struct histb_vdec_ctx *ctx,
 	}
 	capture_state = decoded->error_tainted ? VB2_BUF_STATE_ERROR :
 		VB2_BUF_STATE_DONE;
-	if (ctx->avs && capture_state != VB2_BUF_STATE_DONE)
-		decoded->avs.valid = false;
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE)
 		histb_vdec_finish_h264_field_transaction(ctx, decoded, dst,
 								 capture_state);
@@ -10346,8 +9440,6 @@ static void histb_vdec_commit_vp8_state(struct histb_vdec_ctx *ctx)
 
 static const char *histb_vdec_codec_name(const struct histb_vdec_ctx *ctx)
 {
-	if (ctx->avs)
-		return "AVS";
 	if (ctx->vc1)
 		return "VC-1";
 	if (ctx->vp9)
@@ -10414,8 +9506,12 @@ static void histb_vdec_watchdog(struct work_struct *work)
 }
 
 /*
- * Once VDH completes, detach the request buffers and let the scheduler prepare
- * the next picture while VPSS consumes the completed reconstruction surface.
+ * HEVC at UHD resolution spends a comparable amount of time in request
+ * preparation, VDH and VPSS.  Keeping the mem2mem job current until VPSS has
+ * copied the reconstruction surface serializes all three stages.  Once VDH
+ * has completed, detach this request's buffers and release the scheduler so
+ * the next request can be prepared and decoded while VPSS consumes the
+ * previous, immutable reconstruction surface.
  *
  * The detached capture buffer is still owned by vb2 and remains discoverable
  * by timestamp for stateless reference lookup.  It is returned to userspace
@@ -10427,7 +9523,6 @@ static int histb_vdec_begin_hevc_pipeline(struct histb_vdec_ctx *ctx)
 	struct histb_vdec_dev *vdec = ctx->vdec;
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct vb2_v4l2_buffer *src, *dst;
-	struct histb_vdec_decoded_buffer *decoded;
 	unsigned long flags;
 	bool draining;
 
@@ -10435,14 +9530,6 @@ static int histb_vdec_begin_hevc_pipeline(struct histb_vdec_ctx *ctx)
 	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 	if (WARN_ON(!src || !dst))
 		return -EPIPE;
-
-	decoded = histb_vdec_decoded_buffer(dst);
-	if (decoded->pmv.cpu) {
-		if (decoded->pmv_noncoherent)
-			dma_sync_single_for_cpu(vdec->dev, decoded->pmv.dma,
-						decoded->pmv.size, DMA_BIDIRECTIONAL);
-		decoded->pmv.cpu_owned = true;
-	}
 
 	draining = v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src);
 	histb_vdec_prepare_capture_buffer(ctx, src, dst, VB2_BUF_STATE_DONE,
@@ -10590,24 +9677,6 @@ static void histb_vdec_postprocess(struct work_struct *work)
 		else
 			histb_vdec_discard_vp9_state(ctx);
 	}
-	if (ctx->avs) {
-		struct vb2_v4l2_buffer *dst;
-		struct histb_vdec_decoded_buffer *decoded;
-
-		dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-		if (dst) {
-			decoded = histb_vdec_decoded_buffer(dst);
-			/*
-			 * Publish reference ownership atomically with the final abort
-			 * check so streamoff cannot expose a stale surface.
-			 */
-			spin_lock_irqsave(&vdec->irqlock, flags);
-			aborted = vdec->post_abort;
-			decoded->avs.valid = !ret && !aborted &&
-					     !decoded->error_tainted;
-			spin_unlock_irqrestore(&vdec->irqlock, flags);
-		}
-	}
 	if (ctx->vc1) {
 		mutex_lock(&ctx->vc1_lock);
 		/* Abort takes vc1_lock before publishing post_abort.  Re-read the
@@ -10730,6 +9799,12 @@ static bool histb_vdec_is_cabac_end_error(struct histb_vdec_ctx *ctx,
 	if (ctx->mpeg2) {
 		u32 next_mb = 0;
 
+		/*
+		 * The original VFMW completion path consumes only the low 16 bits
+		 * of UP words 1/2 as the decoded macroblock range.  Word 0 also
+		 * carries picture-dependent status, so it is not a completion
+		 * discriminator for MPEG-2 I/P/B pictures.
+		 */
 		if (!ctx->mpeg2_slices ||
 		    state != ((HISTB_VDEC_STATE_CABAC_END_ERROR &
 				~GENMASK(16, 0)) | ctx->mpeg2_slices) ||
@@ -10739,15 +9814,13 @@ static bool histb_vdec_is_cabac_end_error(struct histb_vdec_ctx *ctx,
 			u32 start = le32_to_cpu(up_msg[i * 4 + 1]) & GENMASK(15, 0);
 			u32 end = le32_to_cpu(up_msg[i * 4 + 2]) & GENMASK(15, 0);
 
-			if (start == 0xffff && end == 0xffff)
-				continue;
-			if (start < next_mb || end < start ||
+			if (start != next_mb || end < start ||
 			    end >= ctx->total_mbs)
 				return false;
 			next_mb = end + 1;
 		}
 
-		return next_mb <= ctx->total_mbs;
+		return next_mb == ctx->total_mbs;
 	}
 
 	if (ctx->hevc) {
@@ -10757,18 +9830,14 @@ static bool histb_vdec_is_cabac_end_error(struct histb_vdec_ctx *ctx,
 				~GENMASK(16, 0)) | ctx->hevc_slices) ||
 		    smmu_state_secure || smmu_state_nonsecure)
 			return false;
-		/* CV200's repeated CABAC_END_ERROR record has no valid CTB range. */
 		for (i = 0; i < ctx->hevc_slices; i++) {
 			u32 start = le32_to_cpu(up_msg[i * 4 + 1]) & GENMASK(15, 0);
 			u32 end = le32_to_cpu(up_msg[i * 4 + 2]) & GENMASK(15, 0);
 
 			up0 = le32_to_cpu(up_msg[i * 4]) & ~BIT(31);
 			up3 = le32_to_cpu(up_msg[i * 4 + 3]);
-			if (((up0 & ~GENMASK(7, 0)) != 0 &&
-			     (up0 & ~GENMASK(7, 0)) != 0x00020000 &&
-			     (up0 & ~GENMASK(7, 0)) != 0x00210000 &&
-			     (up0 & ~GENMASK(7, 0)) != 0x00230000) ||
-			    start != next_ctb || end < start ||
+			if ((up0 != 0 && up0 != 0x00020000 && up0 != 0x00210000 &&
+			     up0 != 0x00230000) || start != next_ctb || end < start ||
 			    end >= ctx->total_mbs ||
 			    (up3 != 0 && up3 != BIT(28) && up3 != BIT(29)))
 				return false;
@@ -10789,6 +9858,78 @@ static bool histb_vdec_is_cabac_end_error(struct histb_vdec_ctx *ctx,
 		up2 == ctx->total_mbs - 1) &&
 	       le32_to_cpu(up_msg[3]) == 0 &&
 	       !smmu_state_secure && !smmu_state_nonsecure;
+}
+
+/*
+ * Name what the VDH said about a failed H.264 picture, so one dmesg line is
+ * enough to tell which stage failed.  Meanings and their evidence:
+ *  - STATE[16:0] number of UP slice reports written [read: vendor
+ *    VDMHAL_V400R003_MakeDecReport: ubfx #0,#17 -> report count].
+ *  - STATE[17] DEC_OVER, STATE[18] DEC_ERR.  The vendor counts a picture as
+ *    clean only when (STATE >> 17) & 3 == 1; for H.264 anything else sets its
+ *    error flag [read, same function].  The community driver accepts
+ *    0x00060001 for CABAC when the UP coverage is complete, because CV200
+ *    raises DEC_ERR at the CABAC end marker [community comment, not vendor].
+ *  - UP word 1/2 low 16 bits: first/last macroblock the VDH decoded for that
+ *    slice [read: vendor copies exactly these into the decode report].
+ *  - UP word 0: not read by the vendor at all.  0x14230000 (bit 31 ignored)
+ *    is what the community saw on clean CABAC pictures; bit 21 present with
+ *    bit 22 clear there.  Bit 22 instead of bit 21 is reported as an abnormal
+ *    slice end [inferred from that one pairing only].
+ */
+static void histb_vdec_h264_explain_failure(struct histb_vdec_ctx *ctx,
+					    u32 state, const __le32 *up_msg)
+{
+	struct device *dev = ctx->vdec->dev;
+	u32 reports = state & GENMASK(16, 0);
+	u32 units = ctx->total_mbs;
+	unsigned int i, n = min_t(unsigned int, ctx->h264_slices,
+				  HISTB_VDEC_H264_DIAG_SLICES);
+
+	dev_err(dev,
+		"H.264 VDH status: reports=%u (slices queued %u) DEC_OVER=%u DEC_ERR=%u unknown-state-bits=%#x; vendor verdict: %s\n",
+		reports, ctx->h264_slices,
+		!!(state & HISTB_VDEC_STATE_DECODE_DONE),
+		!!(state & HISTB_VDEC_STATE_DECODE_ERROR),
+		(u32)(state & ~(GENMASK(16, 0) | HISTB_VDEC_STATE_DECODE_DONE |
+				HISTB_VDEC_STATE_DECODE_ERROR)),
+		((state >> 17) & 3) == 1 ? "clean" :
+		!(state & HISTB_VDEC_STATE_DECODE_DONE) ? "did not finish" :
+		"error flag set");
+	for (i = 0; i < min_t(u32, reports, 8); i++) {
+		u32 up0 = le32_to_cpu(up_msg[i * 4]);
+		u32 start = le32_to_cpu(up_msg[i * 4 + 1]) & GENMASK(15, 0);
+		u32 end = le32_to_cpu(up_msg[i * 4 + 2]) & GENMASK(15, 0);
+		u32 up3 = le32_to_cpu(up_msg[i * 4 + 3]);
+
+		dev_err(dev,
+			"H.264 UP[%u]: MB %u..%u of %u (reached %u%%) word0=%08x [b31=%u b21(clean-end?)=%u b22(abnormal-end?)=%u%s] word3=%08x%s\n",
+			i, start, end, units,
+			units ? (end + 1) * 100 / units : 0,
+			up0, !!(up0 & BIT(31)), !!(up0 & BIT(21)),
+			!!(up0 & BIT(22)),
+			(up0 & ~BIT(31)) == HISTB_VDEC_UP_CABAC_END_ERROR ?
+			" = community CABAC clean end" : "",
+			up3,
+			end + 1 < units && i + 1 == reports ?
+			" <- STOPPED EARLY: slice data ran out or the parse desynced before the last MB" :
+			"");
+	}
+	for (i = 0; i < n; i++) {
+		const struct histb_vdec_h264_diag *d = &ctx->h264_diag[i];
+
+		dev_err(dev,
+			"H.264 slice %u of picture #%u: type=%c first_mb=%u feed=%s nal=%u B fed=%u B epb=%u rbsp-00000x=%u header_bit_size=%u -> header_bits=%u valid_bits=%u tail_bits=%u data=%8ph\n",
+			i, d->picture, "PBIsS"[min_t(u8, d->slice_type, 4)],
+			d->first_mb, d->raw ? "EBSP(raw)" : "RBSP",
+			d->ebsp_bytes, d->fed_bytes, d->epb, d->rbsp_hazards,
+			d->header_bit_size, d->header_bits, d->valid_bits,
+			d->tail_bits, d->head);
+	}
+	if (n && !ctx->h264_diag[0].raw && ctx->h264_diag[0].epb)
+		dev_err(dev,
+			"H.264 hint: this picture had %u emulation-prevention byte(s); if every failing picture has epb>0 and clean ones have none, retry with h264_raw_ebsp=1\n",
+			ctx->h264_diag[0].epb);
 }
 
 static bool histb_vdec_h264_slice_message_valid(struct histb_vdec_ctx *ctx,
@@ -10826,8 +9967,6 @@ static bool histb_vdec_h264_slice_message_valid(struct histb_vdec_ctx *ctx,
 
 static unsigned int histb_vdec_slice_count(const struct histb_vdec_ctx *ctx)
 {
-	if (ctx->avs)
-		return ctx->avs_slices;
 	if (ctx->mpeg2)
 		return ctx->mpeg2_slices;
 	if (ctx->mpeg4)
@@ -10838,40 +9977,6 @@ static unsigned int histb_vdec_slice_count(const struct histb_vdec_ctx *ctx)
 		return ctx->h264_slices;
 
 	return 1;
-}
-
-static bool
-histb_vdec_avs_up_message_valid(const struct histb_vdec_ctx *ctx, u32 state,
-				const __le32 *up_msg, u32 smmu_state_secure,
-				u32 smmu_state_nonsecure)
-{
-	u32 reports = state & GENMASK(16, 0);
-	u32 completion = state & ~GENMASK(16, 0);
-	u32 covered = 0;
-	unsigned int i;
-
-	/*
-	 * VFMW treats DONE|ERROR as a repair report. It is deliverable only when
-	 * the reported macroblock ranges still cover the complete picture.
-	 */
-	if (!ctx->avs || !ctx->avs_slices ||
-	    reports != ctx->avs_slices ||
-	    (completion != HISTB_VDEC_STATE_DECODE_DONE &&
-	     completion != (HISTB_VDEC_STATE_DECODE_DONE |
-			    HISTB_VDEC_STATE_DECODE_ERROR)) ||
-	    smmu_state_secure || smmu_state_nonsecure)
-		return false;
-
-	for (i = 0; i < reports; i++) {
-		u32 start = le32_to_cpu(up_msg[i * 4 + 1]) & GENMASK(15, 0);
-		u32 end = le32_to_cpu(up_msg[i * 4 + 2]) & GENMASK(15, 0);
-
-		if (start != covered || end < start || end >= ctx->avs_total_mbs)
-			return false;
-		covered = end + 1;
-	}
-
-	return covered == ctx->avs_total_mbs;
 }
 
 static bool histb_vdec_vp9_up_message_valid(const struct histb_vdec_ctx *ctx,
@@ -10939,72 +10044,6 @@ static bool histb_vdec_mpeg4_up_message_valid(
 	return covered == ctx->total_mbs;
 }
 
-/* V5R6 make_dec_report consumes uint16 start/end ranges, not CV200's
- * permissive DECODE_ERROR end-of-stream signatures. */
-static bool histb_vdec_v5r6_report_valid(const struct histb_vdec_ctx *ctx,
-				      u32 state, const __le32 *up)
-{
-	u32 reports = state & GENMASK(16, 0);
-	u32 covered = 0;
-	unsigned int i;
-
-	if ((state & GENMASK(18, 17)) != HISTB_VDEC_STATE_DECODE_DONE ||
-	    !reports || reports > HISTB_VDEC_MAX_UP_REPORTS || !ctx->total_mbs)
-		return false;
-	for (i = 0; i < reports; i++) {
-		u32 start = le32_to_cpu(up[i * 4 + 1]) & GENMASK(15, 0);
-		u32 end = le32_to_cpu(up[i * 4 + 2]) & GENMASK(15, 0);
-
-		if (start != covered || end < start || end >= ctx->total_mbs)
-			return false;
-		covered = end + 1;
-	}
-	return covered == ctx->total_mbs;
-}
-
-static bool histb_vdec_cv200_completion_valid(struct histb_vdec_ctx *ctx,
-			u32 state, const __le32 *up_msg, u32 smmu_state_secure,
-			u32 smmu_state_nonsecure)
-{
-	bool message_error;
-	bool cabac_end_error;
-
-	message_error =
-		(ctx->avs &&
-		 !histb_vdec_avs_up_message_valid(ctx, state, up_msg,
-						 smmu_state_secure, smmu_state_nonsecure)) ||
-		(ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE &&
-		 !histb_vdec_h264_slice_message_valid(ctx, state, up_msg,
-						     smmu_state_secure, smmu_state_nonsecure)) ||
-		(ctx->vp9 &&
-		 !histb_vdec_vp9_up_message_valid(ctx, state, up_msg,
-							 smmu_state_secure, smmu_state_nonsecure)) ||
-		(ctx->mpeg4 &&
-		 !histb_vdec_mpeg4_up_message_valid(ctx, state, up_msg,
-							 smmu_state_secure, smmu_state_nonsecure)) ||
-		(ctx->vc1 && histb_vc1_validate_up_reports(
-			state, smmu_state_secure, smmu_state_nonsecure,
-			ctx->total_mbs, (const struct histb_vc1_up_report *)up_msg,
-			HISTB_VC1_MAX_UP_REPORTS) != HISTB_VC1_OK);
-	cabac_end_error = ctx->avs ? !message_error :
-		ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ?
-		!message_error : ctx->vp9 ? !message_error : ctx->mpeg4 ?
-		!message_error : ctx->vc1 ? !message_error :
-		histb_vdec_is_cabac_end_error(ctx, state, up_msg,
-					       smmu_state_secure, smmu_state_nonsecure);
-
-	return !message_error && (state & HISTB_VDEC_STATE_DECODE_DONE) &&
-		!((state & HISTB_VDEC_STATE_DECODE_ERROR) && !cabac_end_error);
-}
-
-static bool histb_vdec_mv310_completion_valid(struct histb_vdec_ctx *ctx,
-			u32 state, const __le32 *up_msg, u32 smmu_state_secure,
-			u32 smmu_state_nonsecure)
-{
-	return histb_vdec_v5r6_report_valid(ctx, state, up_msg) &&
-		!smmu_state_secure && !smmu_state_nonsecure;
-}
-
 static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 {
 	struct histb_vdec_dev *vdec = data;
@@ -11013,7 +10052,7 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 	__le32 *up_msg;
 	unsigned long flags;
 	u32 expected_state, state, status;
-	bool cancelled = false, decode_failed, message_error;
+	bool cabac_end_error, cancelled = false, decode_failed, message_error;
 	bool phase_error = false, post_busy = false;
 	bool post_published = false;
 	bool hevc_pipelined = false;
@@ -11039,26 +10078,6 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	ctx = vdec->curr_ctx;
 	if (ctx) {
-		if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1 && ctx->mpeg1) {
-			ctx->mpeg1->state = state;
-			ctx->mpeg1->smmu_secure = smmu_state_secure;
-			ctx->mpeg1->smmu_nonsecure = smmu_state_nonsecure;
-			spin_unlock_irqrestore(&vdec->irqlock, flags);
-			mutex_unlock(&vdec->launch_lock);
-			dma_rmb();
-			complete(&ctx->mpeg1->done);
-			return IRQ_HANDLED;
-		}
-		if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2 && ctx->avs2) {
-			ctx->avs2->state = state;
-			ctx->avs2->smmu_secure = smmu_state_secure;
-			ctx->avs2->smmu_nonsecure = smmu_state_nonsecure;
-			spin_unlock_irqrestore(&vdec->irqlock, flags);
-			mutex_unlock(&vdec->launch_lock);
-			dma_rmb();
-			complete(&ctx->avs2->done);
-			return IRQ_HANDLED;
-		}
 		phase = vdec->phase;
 		if (phase == HISTB_VDEC_PHASE_BPD) {
 			/* A stale VDH interrupt cannot take the synchronous BPD owner. */
@@ -11148,9 +10167,7 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 	}
 
 	up_msg = histb_vdec_msg_slot(ctx, HISTB_VDEC_UP_MSG_SLOT);
-	expected_state = ctx->avs ?
-		HISTB_VDEC_STATE_DECODE_DONE | ctx->avs_slices :
-		ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ?
+	expected_state = ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ?
 			HISTB_VDEC_STATE_DECODE_DONE |
 			ctx->h264_slices : ctx->mpeg4 ?
 			HISTB_VDEC_STATE_DECODE_DONE | 1 : ctx->mpeg2 ?
@@ -11158,9 +10175,33 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 			ctx->mpeg2_slices : ctx->hevc ?
 			(HISTB_VDEC_STATE_CABAC_END_ERROR & ~GENMASK(16, 0)) |
 			ctx->hevc_slices : HISTB_VDEC_STATE_CABAC_END_ERROR;
-	message_error = !vdec->backend->completion_valid(ctx, state, up_msg,
-						 smmu_state_secure, smmu_state_nonsecure);
-	decode_failed = message_error;
+	message_error =
+		(ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE &&
+		 !histb_vdec_h264_slice_message_valid(ctx, state, up_msg,
+						     smmu_state_secure,
+						     smmu_state_nonsecure)) ||
+		(ctx->vp9 &&
+		 !histb_vdec_vp9_up_message_valid(ctx, state, up_msg,
+							 smmu_state_secure,
+							 smmu_state_nonsecure)) ||
+		(ctx->mpeg4 &&
+		 !histb_vdec_mpeg4_up_message_valid(ctx, state, up_msg,
+							 smmu_state_secure,
+							 smmu_state_nonsecure)) ||
+		(ctx->vc1 && histb_vc1_validate_up_reports(
+			state,
+			smmu_state_secure, smmu_state_nonsecure,
+			ctx->total_mbs,
+			(const struct histb_vc1_up_report *)up_msg,
+			HISTB_VC1_MAX_UP_REPORTS) != HISTB_VC1_OK);
+	cabac_end_error = ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ?
+		!message_error : ctx->vp9 ? !message_error : ctx->mpeg4 ?
+		!message_error : ctx->vc1 ? !message_error :
+		histb_vdec_is_cabac_end_error(ctx, state, up_msg,
+					       smmu_state_secure,
+					       smmu_state_nonsecure);
+	decode_failed = message_error || !(state & HISTB_VDEC_STATE_DECODE_DONE) ||
+		((state & HISTB_VDEC_STATE_DECODE_ERROR) && !cabac_end_error);
 
 	/* Account for hardware completion before CPU postprocessing. */
 	histb_vdec_account_job(vdec, decode_failed);
@@ -11177,10 +10218,10 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 			le32_to_cpu(up_msg[2]), le32_to_cpu(up_msg[3]),
 			ctx->h264_new_frame, ctx->h264_last_slice,
 			ctx->h264_partial, ctx->h264_first_mb);
+		if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE)
+			histb_vdec_h264_explain_failure(ctx, state, up_msg);
 		for (i = 1;
-		     (ctx->avs && i < ctx->avs_slices) ||
 		     (ctx->hevc && i < ctx->hevc_slices) ||
-		     (ctx->mpeg2 && i < ctx->mpeg2_slices) ||
 		     (ctx->vp9 &&
 		      i < min_t(u32, state & GENMASK(16, 0),
 				HISTB_VDEC_MAX_UP_REPORTS)) ||
@@ -11204,26 +10245,6 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 			readl(vdec->regs + HISTB_VDEC_SMMU_FAULT_RD_NS),
 			readl(vdec->regs + HISTB_VDEC_SMMU_FAULT_WR_S),
 			readl(vdec->regs + HISTB_VDEC_SMMU_FAULT_WR_NS));
-		if (ctx->hevc)
-			dev_err(vdec->dev,
-				"HEVC geom main10=%u ystride=%#x chroma=%#x y2=%#x yo2=%#x co2=%#x avm=%#x vam=%#x\n",
-				ctx->hevc_main10,
-				readl(vdec->regs + HISTB_VDEC_Y_STRIDE),
-				readl(vdec->regs + HISTB_VDEC_CHROMA_OFFSET),
-				readl(vdec->regs + HISTB_VDEC_Y_STRIDE_2BIT),
-				readl(vdec->regs + HISTB_VDEC_Y_OFFSET_2BIT),
-				readl(vdec->regs + HISTB_VDEC_CHROMA_OFFSET_2BIT),
-				readl(vdec->regs + HISTB_VDEC_AVM_ADDR),
-				readl(vdec->regs + HISTB_VDEC_VAM_ADDR));
-		if (ctx->vc1)
-			dev_err(vdec->dev,
-				"VC1 messages pic=%*ph slice=%*ph BPD=%08x/%08x\n",
-				64, ctx->buffers[HISTB_VDEC_BUF_MSG].cpu +
-					HISTB_VDEC_VC1_PIC_MSG_OFFSET,
-				20, ctx->buffers[HISTB_VDEC_BUF_MSG].cpu +
-					HISTB_VDEC_VC1_SLICE_MSG_OFFSET,
-				readl(vdec->regs + HISTB_VC1_BPD_OFFSET + HISTB_VC1_BPD_OUT0),
-				readl(vdec->regs + HISTB_VC1_BPD_OFFSET + HISTB_VC1_BPD_OUT1));
 		mutex_lock(&vdec->launch_lock);
 		histb_vdec_reset_engine(vdec);
 		mutex_unlock(&vdec->launch_lock);
@@ -11324,35 +10345,6 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 	unsigned long flags;
 	bool active, pipelined = false, post, taken = false;
 
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1 && ctx->mpeg1) {
-		mutex_lock(&vdec->launch_lock);
-		WRITE_ONCE(ctx->mpeg1->aborted, true);
-		spin_lock_irqsave(&vdec->irqlock, flags);
-		active = vdec->curr_ctx == ctx;
-		spin_unlock_irqrestore(&vdec->irqlock, flags);
-		if (active) {
-			histb_v5r6_reset(vdec->regs);
-			complete(&ctx->mpeg1->done);
-		}
-		mutex_unlock(&vdec->launch_lock);
-		/* Wait for message, surface, OUTPUT and display ownership to settle. */
-		mutex_lock(&ctx->mpeg1->lock);
-		mutex_unlock(&ctx->mpeg1->lock);
-		return;
-	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2 && ctx->avs2) {
-		mutex_lock(&vdec->launch_lock);
-		spin_lock_irqsave(&vdec->irqlock, flags);
-		active = vdec->curr_ctx == ctx;
-		ctx->avs2->aborted = true;
-		spin_unlock_irqrestore(&vdec->irqlock, flags);
-		if (active) {
-			histb_v5r6_reset(vdec->regs);
-			complete(&ctx->avs2->done);
-		}
-		mutex_unlock(&vdec->launch_lock);
-		return;
-	}
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	active = vdec->curr_ctx == ctx;
 	if (active) {
@@ -11365,9 +10357,20 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 	}
 	spin_unlock_irqrestore(&vdec->irqlock, flags);
 	if (ctx->vc1) {
-		wait_for_completion(&ctx->vc1_setup_idle);
-		/* Both queues may stream off; keep the completed barrier observable. */
-		complete(&ctx->vc1_setup_idle);
+		/*
+		 * abort() runs from stop_streaming()/release() with the device
+		 * wide vfd->lock held, so this wait must be bounded: an
+		 * unbounded one turns one stuck VC-1 setup into a device that
+		 * answers no ioctl at all.
+		 */
+		if (wait_for_completion_timeout(&ctx->vc1_setup_idle,
+				msecs_to_jiffies(HISTB_VDEC_IDLE_WAIT_MS)))
+			/* Both queues may stream off; keep the barrier observable. */
+			complete(&ctx->vc1_setup_idle);
+		else
+			dev_warn(vdec->dev,
+				 "VC-1 setup did not go idle within %u ms\n",
+				 HISTB_VDEC_IDLE_WAIT_MS);
 	}
 	/* The synchronous BPD caller is the sole buffer and PM owner. */
 	if (active && phase == HISTB_VDEC_PHASE_BPD) {
@@ -11387,19 +10390,15 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 			mutex_lock(&ctx->vc1_lock);
 			spin_lock_irqsave(&vdec->irqlock, flags);
 			post = vdec->post_ctx == ctx;
-			if (post) {
+			if (post)
 				vdec->post_abort = true;
-				pipelined = vdec->post_pipelined;
-			}
 			spin_unlock_irqrestore(&vdec->irqlock, flags);
 			mutex_unlock(&ctx->vc1_lock);
 		} else {
 			spin_lock_irqsave(&vdec->irqlock, flags);
 			post = vdec->post_ctx == ctx;
-			if (post) {
+			if (post)
 				vdec->post_abort = true;
-				pipelined = vdec->post_pipelined;
-			}
 			spin_unlock_irqrestore(&vdec->irqlock, flags);
 		}
 		if (!post)
@@ -11452,34 +10451,6 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 		flush_work(&vdec->postprocess_work);
 }
 
-static void histb_vdec_start_v5r6(struct histb_vdec_ctx *ctx,
-		dma_addr_t picture, dma_addr_t report, dma_addr_t stream,
-		dma_addr_t reconstruction, u32 basic_cfg0, u32 basic_cfg1)
-{
-	u32 stride = histb_vdec_surface_stride(ctx);
-	u32 height = ALIGN(ctx->src.pix.height,
-			   histb_vdec_surface_height_align(ctx));
-	struct histb_v5r6_registers config = {
-		.basic_cfg0 = basic_cfg0,
-		.basic_cfg1 = basic_cfg1,
-		.picture = picture,
-		.report = report,
-		.stream = round_down(stream, 16),
-		.reconstruction = reconstruction,
-		.y_stride = stride,
-		.chroma_offset = stride * height,
-		.low_bits = ctx->hevc_main10,
-		.low_stride = stride / 4,
-		.low_y_offset = stride * height * 3 / 2,
-		/* UVOFFSET_2BIT is relative to low Y, not reconstruction Y. */
-		.low_chroma_offset = (stride / 4) * height,
-		.avs = ctx->avs,
-		.emar = ctx->src.pix.width <= 4096,
-	};
-
-	histb_v5r6_start(ctx->vdec->regs, &config);
-}
-
 static void histb_vdec_program_mpeg2_registers(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_decoded_buffer *decoded,
@@ -11493,13 +10464,6 @@ static void histb_vdec_program_mpeg2_registers(
 	u32 max_slice_group = DIV_ROUND_UP(ctx->mpeg2_slices, 64) - 1;
 	u32 offset;
 
-	if (vdec->backend->start) {
-		vdec->backend->start(ctx, pic_msg, up_msg, src_dma,
-				      decoded->tile.dma,
-				      HISTB_VDEC_BASIC_CFG0_MPEG2 | (total_mbs - 1),
-				      0x00034003);
-		return;
-	}
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
@@ -11560,13 +10524,6 @@ static void histb_vdec_program_mpeg4_registers(struct histb_vdec_ctx *ctx)
 	struct histb_vdec_dev *vdec = ctx->vdec;
 	u32 offset;
 
-	if (vdec->backend->start) {
-		vdec->backend->start(ctx, regs->avm_addr, regs->vam_addr,
-				      regs->stream_base, regs->current_picture_addr,
-				      0x42400000 | (regs->basic_cfg0 & GENMASK(19, 0)),
-				      0x0003c002);
-		return;
-	}
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
@@ -11623,14 +10580,6 @@ static void histb_vdec_program_vc1_registers(
 			   127) >> 7) << 4;
 	u32 offset;
 
-	if (vdec->backend->start) {
-		vdec->backend->start(ctx,
-				      msg_dma + HISTB_VDEC_VC1_PIC_MSG_OFFSET, msg_dma,
-				      ctx->vc1_pending_stream_base, decoded->tile.dma,
-				      HISTB_VDEC_BASIC_CFG0_VC1 | (ctx->total_mbs - 1),
-				      HISTB_VDEC_BASIC_CFG1_VC1 | BIT(17));
-		return;
-	}
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
@@ -11834,16 +10783,6 @@ static void histb_vdec_program_registers(struct histb_vdec_ctx *ctx,
 		HISTB_VDEC_UP_MSG_SLOT * HISTB_VDEC_H264_MSG_SLOT_SIZE;
 	u32 offset;
 
-	if (vdec->backend->start) {
-		vdec->backend->start(ctx, pic_msg, up_msg, src_dma,
-				      decoded->tile.dma,
-				      HISTB_VDEC_BASIC_CFG0_H264 | (total_mbs - 1),
-				      (HISTB_VDEC_BASIC_CFG1_I_SLICE &
-				       ~HISTB_VDEC_BASIC_CFG1_NEW_PIC) | BIT(17) |
-				      (ctx->h264_new_frame ? HISTB_VDEC_BASIC_CFG1_NEW_PIC : 0) |
-				      (mbaff ? HISTB_VDEC_BASIC_CFG1_MBAFF : 0));
-		return;
-	}
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
@@ -11904,81 +10843,6 @@ static void histb_vdec_program_registers(struct histb_vdec_ctx *ctx,
 	writel(0, vdec->regs + HISTB_VDEC_START);
 }
 
-static void
-histb_vdec_program_avs_registers(struct histb_vdec_ctx *ctx,
-				 struct histb_vdec_decoded_buffer *decoded,
-				 dma_addr_t src_dma, u32 total_mbs)
-{
-	struct histb_vdec_dev *vdec = ctx->vdec;
-	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
-	dma_addr_t pic_msg = msg_dma + HISTB_VDEC_AVS_PIC_MSG_OFFSET;
-	dma_addr_t up_msg = msg_dma;
-	dma_addr_t dnr_mbinfo;
-	u32 stride = histb_vdec_surface_stride(ctx);
-	u32 chroma_offset;
-	u32 offset;
-
-	if (vdec->backend->start) {
-		vdec->backend->start(ctx, pic_msg, up_msg, src_dma,
-				      decoded->tile.dma,
-				      HISTB_VDEC_BASIC_CFG0_AVS | (total_mbs - 1),
-				      0x00034006 | (ctx->avs_basic_cfg1 & BIT(15)));
-		return;
-	}
-	chroma_offset = stride * ALIGN(ctx->src.pix.height,
-					      histb_vdec_surface_height_align(ctx));
-	dnr_mbinfo = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_AVS_DNR_MBINFO);
-	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
-	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
-	histb_vdec_program_smmu(vdec, true);
-	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_MASK_NS);
-	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_S);
-	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_NS);
-	writel(HISTB_VDEC_BASIC_CFG0_AVS | (total_mbs - 1),
-	       vdec->regs + HISTB_VDEC_BASIC_CFG0);
-	writel(ctx->avs_basic_cfg1 | HISTB_VDEC_BASIC_CFG1_AVS_MMU_EN,
-	       vdec->regs + HISTB_VDEC_BASIC_CFG1);
-	writel(lower_32_bits(pic_msg), vdec->regs + HISTB_VDEC_AVM_ADDR);
-	writel(lower_32_bits(up_msg), vdec->regs + HISTB_VDEC_VAM_ADDR);
-	writel(lower_32_bits(round_down(src_dma, 16)),
-	       vdec->regs + HISTB_VDEC_STREAM_BASE);
-	writel(1, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
-	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
-	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 120 ?
-		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
-	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
-	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
-	     offset <= HISTB_VDEC_TIMEOUT_LAST; offset += 4)
-		writel(HISTB_VDEC_TIMEOUT_VALUE, vdec->regs + offset);
-
-	writel(lower_32_bits(round_down(decoded->tile.dma, 16)),
-	       vdec->regs + HISTB_VDEC_CURRENT_Y);
-	writel(stride * 16, vdec->regs + HISTB_VDEC_Y_STRIDE);
-	writel(chroma_offset, vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
-	writel(0, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
-	writel(0, vdec->regs + HISTB_VDEC_STORE_PARAM);
-	writel(0, vdec->regs + HISTB_VDEC_LINE_NUM_ADDR);
-	writel(0, vdec->regs + HISTB_VDEC_Y_STRIDE_2BIT);
-	writel(0, vdec->regs + HISTB_VDEC_Y_OFFSET_2BIT);
-	writel(0, vdec->regs + HISTB_VDEC_CHROMA_OFFSET_2BIT);
-	writel(0, vdec->regs + HISTB_VDEC_PPFD_ADDR);
-	writel(0, vdec->regs + HISTB_VDEC_PPFD_SIZE);
-	writel(lower_32_bits(dnr_mbinfo),
-	       vdec->regs + HISTB_VDEC_DNR_MBINFO_ADDR);
-	writel(0, vdec->regs + HISTB_VDEC_REF_PIC_TYPE);
-	writel(0, vdec->regs + HISTB_VDEC_FF_APT_ENABLE);
-	writel(0xaaaaaaaa, vdec->regs + HISTB_VDEC_DOWN_CLK_CFG);
-	writel(HISTB_VDEC_INT_ENABLE_DONE, vdec->regs + HISTB_VDEC_INT_MASK);
-	writel(3, vdec->regs + HISTB_VDEC_SCD_CLOCK_GATE);
-	usleep_range(30, 60);
-	/* Publish coherent messages and all register writes before VDH starts. */
-	wmb();
-	writel(0, vdec->regs + HISTB_VDEC_START);
-	writel(1, vdec->regs + HISTB_VDEC_START);
-	writel(0, vdec->regs + HISTB_VDEC_START);
-}
-
 static void histb_vdec_program_hevc_registers(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_decoded_buffer *decoded,
@@ -11992,15 +10856,6 @@ static void histb_vdec_program_hevc_registers(
 		HISTB_VDEC_UP_MSG_SLOT * HISTB_VDEC_HEVC_MSG_SLOT_SIZE;
 	u32 offset;
 
-	if (vdec->backend->start) {
-		vdec->backend->start(ctx, pic_msg, up_msg, src_dma,
-				      decoded->tile.dma,
-				      HISTB_VDEC_BASIC_CFG0_HEVC |
-				      (ctx->hevc_scaling_list ? BIT(30) : 0) |
-				      (total_ctbs - 1),
-				      HISTB_VDEC_BASIC_CFG1_HEVC);
-		return;
-	}
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
@@ -12044,7 +10899,6 @@ static void histb_vdec_program_hevc_registers(
 		       vdec->regs + HISTB_VDEC_Y_STRIDE_2BIT);
 		writel(stride * height * 3 / 2,
 		       vdec->regs + HISTB_VDEC_Y_OFFSET_2BIT);
-		/* Unlike VPSS's absolute plane address, this offset starts at low Y. */
 		writel((stride / 4) * height,
 		       vdec->regs + HISTB_VDEC_CHROMA_OFFSET_2BIT);
 	} else {
@@ -12252,734 +11106,785 @@ finish_no_pm:
 	complete(&ctx->vc1_setup_idle);
 }
 
-static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
-					 struct v4l2_pix_format *pix);
 
-static void histb_vdec_mpeg1_free(struct histb_vdec_ctx *ctx)
+/*
+ * ---- H.264 FRAME_BASED decode mode (Chromium's V4L2 stateless decoder) ----
+ *
+ * Chromium sends DECODE_MODE = FRAME_BASED: the OUTPUT buffer holds a whole
+ * access unit as 00 00 01 <NAL> units, and the only per-picture controls are
+ * SPS, PPS, SCALING_MATRIX and DECODE_PARAMS - no SLICE_PARAMS, no
+ * PRED_WEIGHTS, no reference lists, no P/B frame flags.  This VDH needs all of
+ * them per slice, so the driver does what a hardware parser would: split the
+ * unit into slices, parse each slice header (7.3.3), build the reference lists
+ * (8.2.4, initial order from v4l2-h264, then the modification commands) and
+ * then run the same per-slice staging that the SLICE_BASED path uses.
+ */
+#define HISTB_H264_MAX_HDR_BYTES	1024
+#define HISTB_H264_MAX_MODS		34
+
+struct histb_h264_mod {
+	u8 idc;
+	u32 val;
+};
+
+struct histb_h264_hdr {
+	struct v4l2_ctrl_h264_slice_params slice;
+	struct v4l2_ctrl_h264_pred_weights pw;
+	bool has_pw;
+	bool idr;
+	u8 nal_unit_type;
+	struct histb_h264_mod mods[2][HISTB_H264_MAX_MODS];
+	unsigned int num_mods[2];
+};
+
+static int histb_h264_ue(struct histb_vdec_bitreader *br, u32 *v)
 {
-	unsigned int i;
+	u32 zeros = 0, bit, rest = 0, n;
 
-	if (!ctx->mpeg1)
-		return;
-	for (i = 0; i < HISTB_MPEG1_SLOTS; i++)
-		histb_vdec_free_decoded_buffers(ctx, &ctx->mpeg1->surface[i]);
-	kfree(ctx->mpeg1);
-	ctx->mpeg1 = NULL;
+	for (;;) {
+		if (histb_vdec_read_bits(br, 1, &bit))
+			return -EINVAL;
+		if (bit)
+			break;
+		if (++zeros > 31)
+			return -EINVAL;
+	}
+	for (n = zeros; n; ) {
+		u32 chunk = min(n, 16U), part;
+
+		if (histb_vdec_read_bits(br, chunk, &part))
+			return -EINVAL;
+		rest = (rest << chunk) | part;
+		n -= chunk;
+	}
+	*v = ((1U << zeros) - 1) + rest;
+	return 0;
 }
 
-static int histb_vdec_mpeg1_alloc(struct histb_vdec_ctx *ctx)
+static int histb_h264_se(struct histb_vdec_bitreader *br, s32 *v)
 {
-	static const unsigned int index[] = {
-		HISTB_VDEC_BUF_MSG, HISTB_VDEC_BUF_PMV_TOP,
-	};
-	struct device *dev = ctx->vdec->dev;
-	unsigned int i;
+	u32 k;
 
-	if (!ctx->mpeg1) {
-		ctx->mpeg1 = kzalloc(sizeof(*ctx->mpeg1), GFP_KERNEL);
-		if (!ctx->mpeg1)
-			return -ENOMEM;
-		histb_mpeg1_init(&ctx->mpeg1->decoder);
-		mutex_init(&ctx->mpeg1->lock);
-		init_completion(&ctx->mpeg1->done);
-		ctx->mpeg1->output_slot = -1;
+	if (histb_h264_ue(br, &k))
+		return -EINVAL;
+	*v = (k & 1) ? (s32)((k + 1) >> 1) : -(s32)(k >> 1);
+	return 0;
+}
+
+static int histb_h264_parse_pred_weights(struct histb_vdec_bitreader *br,
+		const struct v4l2_ctrl_h264_sps *sps,
+		struct v4l2_ctrl_h264_slice_params *slice,
+		struct v4l2_ctrl_h264_pred_weights *pw)
+{
+	bool chroma = sps->chroma_format_idc != 0;
+	unsigned int list, i, lists = slice->slice_type == V4L2_H264_SLICE_TYPE_B ? 2 : 1;
+	u32 v, flag;
+	s32 sv;
+
+	if (histb_h264_ue(br, &v) || v > 7)
+		return -EINVAL;
+	pw->luma_log2_weight_denom = v;
+	pw->chroma_log2_weight_denom = 0;
+	if (chroma) {
+		if (histb_h264_ue(br, &v) || v > 7)
+			return -EINVAL;
+		pw->chroma_log2_weight_denom = v;
 	}
-	for (i = 0; i < ARRAY_SIZE(index); i++) {
-		struct histb_vdec_dma_buffer *b = &ctx->buffers[index[i]];
+	for (list = 0; list < lists; list++) {
+		struct v4l2_h264_weight_factors *wf = &pw->weight_factors[list];
+		unsigned int n = (list ? slice->num_ref_idx_l1_active_minus1 :
+					 slice->num_ref_idx_l0_active_minus1) + 1;
 
-		if (b->cpu)
+		for (i = 0; i < n; i++) {
+			wf->luma_weight[i] = 1 << pw->luma_log2_weight_denom;
+			wf->luma_offset[i] = 0;
+			if (histb_vdec_read_bits(br, 1, &flag))
+				return -EINVAL;
+			if (flag) {
+				if (histb_h264_se(br, &sv))
+					return -EINVAL;
+				wf->luma_weight[i] = sv;
+				if (histb_h264_se(br, &sv))
+					return -EINVAL;
+				wf->luma_offset[i] = sv;
+			}
+			wf->chroma_weight[i][0] = wf->chroma_weight[i][1] =
+				1 << pw->chroma_log2_weight_denom;
+			wf->chroma_offset[i][0] = wf->chroma_offset[i][1] = 0;
+			if (!chroma)
+				continue;
+			if (histb_vdec_read_bits(br, 1, &flag))
+				return -EINVAL;
+			if (flag) {
+				unsigned int j;
+
+				for (j = 0; j < 2; j++) {
+					if (histb_h264_se(br, &sv))
+						return -EINVAL;
+					wf->chroma_weight[i][j] = sv;
+					if (histb_h264_se(br, &sv))
+						return -EINVAL;
+					wf->chroma_offset[i][j] = sv;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Parse one slice NAL (RBSP, header byte included) up to the first bit of
+ * slice_data().  Fills the slice params, the weight table and the list
+ * modification commands; header_bit_size counts from the NAL header byte, like
+ * the SLICE_BASED clients report it.
+ */
+static int histb_h264_parse_slice_header(const u8 *rbsp, size_t size,
+		const struct v4l2_ctrl_h264_sps *sps,
+		const struct v4l2_ctrl_h264_pps *pps,
+		const struct v4l2_ctrl_h264_decode_params *decode,
+		struct histb_h264_hdr *h)
+{
+	struct histb_vdec_bitreader br = { .data = rbsp, .size = size, .bitpos = 8 };
+	struct v4l2_ctrl_h264_slice_params *s = &h->slice;
+	bool field_pic = false;
+	u32 v, flag, type, list, nref[2];
+	s32 sv;
+
+	memset(h, 0, sizeof(*h));
+	if (!size)
+		return -EINVAL;
+	h->nal_unit_type = rbsp[0] & 0x1f;
+	h->idr = h->nal_unit_type == 5;
+	if (h->nal_unit_type != 1 && h->nal_unit_type != 5)
+		return -ENOENT;
+
+	if (histb_h264_ue(&br, &v))
+		return -EINVAL;
+	s->first_mb_in_slice = v;
+	if (histb_h264_ue(&br, &type) || type > 9)
+		return -EINVAL;
+	s->slice_type = type % 5;
+	if (histb_h264_ue(&br, &v))		/* pic_parameter_set_id */
+		return -EINVAL;
+	if (sps->flags & V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE) {
+		if (histb_vdec_read_bits(&br, 2, &v))
+			return -EINVAL;
+		s->colour_plane_id = v;
+	}
+	if (histb_vdec_read_bits(&br, sps->log2_max_frame_num_minus4 + 4, &v))
+		return -EINVAL;
+	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY)) {
+		if (histb_vdec_read_bits(&br, 1, &flag))
+			return -EINVAL;
+		field_pic = flag;
+		if (field_pic && histb_vdec_read_bits(&br, 1, &flag))
+			return -EINVAL;
+	}
+	if (h->idr && histb_h264_ue(&br, &v))	/* idr_pic_id */
+		return -EINVAL;
+	if (sps->pic_order_cnt_type == 0) {
+		if (histb_vdec_read_bits(&br,
+					 sps->log2_max_pic_order_cnt_lsb_minus4 + 4, &v))
+			return -EINVAL;
+		if ((pps->flags & V4L2_H264_PPS_FLAG_BOTTOM_FIELD_PIC_ORDER_IN_FRAME_PRESENT) &&
+		    !field_pic && histb_h264_se(&br, &sv))
+			return -EINVAL;
+	} else if (sps->pic_order_cnt_type == 1 &&
+		   !(sps->flags & V4L2_H264_SPS_FLAG_DELTA_PIC_ORDER_ALWAYS_ZERO)) {
+		if (histb_h264_se(&br, &sv))
+			return -EINVAL;
+		if ((pps->flags & V4L2_H264_PPS_FLAG_BOTTOM_FIELD_PIC_ORDER_IN_FRAME_PRESENT) &&
+		    !field_pic && histb_h264_se(&br, &sv))
+			return -EINVAL;
+	}
+	if ((pps->flags & V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT) &&
+	    histb_h264_ue(&br, &v))
+		return -EINVAL;
+	if (s->slice_type == V4L2_H264_SLICE_TYPE_B) {
+		if (histb_vdec_read_bits(&br, 1, &flag))
+			return -EINVAL;
+		if (flag)
+			s->flags |= V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED;
+	}
+	nref[0] = pps->num_ref_idx_l0_default_active_minus1;
+	nref[1] = pps->num_ref_idx_l1_default_active_minus1;
+	if (s->slice_type == V4L2_H264_SLICE_TYPE_P ||
+	    s->slice_type == V4L2_H264_SLICE_TYPE_SP ||
+	    s->slice_type == V4L2_H264_SLICE_TYPE_B) {
+		if (histb_vdec_read_bits(&br, 1, &flag))
+			return -EINVAL;
+		if (flag) {
+			if (histb_h264_ue(&br, &nref[0]))
+				return -EINVAL;
+			if (s->slice_type == V4L2_H264_SLICE_TYPE_B &&
+			    histb_h264_ue(&br, &nref[1]))
+				return -EINVAL;
+		}
+		if (nref[0] > 31 || nref[1] > 31)
+			return -EINVAL;
+		s->num_ref_idx_l0_active_minus1 = nref[0];
+		if (s->slice_type == V4L2_H264_SLICE_TYPE_B)
+			s->num_ref_idx_l1_active_minus1 = nref[1];
+
+		/* ref_pic_list_modification() */
+		for (list = 0; list < (s->slice_type == V4L2_H264_SLICE_TYPE_B ? 2U : 1U); list++) {
+			if (histb_vdec_read_bits(&br, 1, &flag))
+				return -EINVAL;
+			if (!flag)
+				continue;
+			for (;;) {
+				u32 idc, val = 0;
+
+				if (histb_h264_ue(&br, &idc) || idc > 3)
+					return -EINVAL;
+				if (idc == 3)
+					break;
+				if (histb_h264_ue(&br, &val))
+					return -EINVAL;
+				if (h->num_mods[list] >= HISTB_H264_MAX_MODS)
+					return -EINVAL;
+				h->mods[list][h->num_mods[list]].idc = idc;
+				h->mods[list][h->num_mods[list]].val = val;
+				h->num_mods[list]++;
+			}
+		}
+	}
+	if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, s)) {
+		if (histb_h264_parse_pred_weights(&br, sps, s, &h->pw))
+			return -EINVAL;
+		h->has_pw = true;
+	}
+	if (decode->nal_ref_idc) {			/* dec_ref_pic_marking() */
+		if (h->idr) {
+			if (histb_vdec_read_bits(&br, 2, &v))
+				return -EINVAL;
+		} else {
+			if (histb_vdec_read_bits(&br, 1, &flag))
+				return -EINVAL;
+			while (flag) {
+				u32 op;
+
+				if (histb_h264_ue(&br, &op) || op > 6)
+					return -EINVAL;
+				if (!op)
+					break;
+				if ((op == 1 || op == 3) && histb_h264_ue(&br, &v))
+					return -EINVAL;
+				if (op == 2 && histb_h264_ue(&br, &v))
+					return -EINVAL;
+				if ((op == 3 || op == 6) && histb_h264_ue(&br, &v))
+					return -EINVAL;
+				if (op == 4 && histb_h264_ue(&br, &v))
+					return -EINVAL;
+			}
+		}
+	}
+	if ((pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) &&
+	    s->slice_type != V4L2_H264_SLICE_TYPE_I &&
+	    s->slice_type != V4L2_H264_SLICE_TYPE_SI) {
+		if (histb_h264_ue(&br, &v) || v > 2)
+			return -EINVAL;
+		s->cabac_init_idc = v;
+	}
+	if (histb_h264_se(&br, &sv))
+		return -EINVAL;
+	s->slice_qp_delta = sv;
+	if (s->slice_type == V4L2_H264_SLICE_TYPE_SP ||
+	    s->slice_type == V4L2_H264_SLICE_TYPE_SI) {
+		if (s->slice_type == V4L2_H264_SLICE_TYPE_SP) {
+			if (histb_vdec_read_bits(&br, 1, &flag))
+				return -EINVAL;
+			if (flag)
+				s->flags |= V4L2_H264_SLICE_FLAG_SP_FOR_SWITCH;
+		}
+		if (histb_h264_se(&br, &sv))
+			return -EINVAL;
+		s->slice_qs_delta = sv;
+	}
+	if (pps->flags & V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT) {
+		if (histb_h264_ue(&br, &v) || v > 2)
+			return -EINVAL;
+		s->disable_deblocking_filter_idc = v;
+		if (v != 1) {
+			if (histb_h264_se(&br, &sv))
+				return -EINVAL;
+			s->slice_alpha_c0_offset_div2 = sv;
+			if (histb_h264_se(&br, &sv))
+				return -EINVAL;
+			s->slice_beta_offset_div2 = sv;
+		}
+	}
+	/* FMO (slice_group_change_cycle) is refused by the PPS validation. */
+	s->header_bit_size = br.bitpos;
+	return 0;
+}
+
+/* PicNum / LongTermPicNum of one DPB reference (8.2.4.1) for a frame or one field. */
+static s32 histb_h264_ref_num(const struct v4l2_h264_dpb_entry *e, u8 fields,
+			      const struct v4l2_ctrl_h264_decode_params *decode,
+			      const struct v4l2_ctrl_h264_sps *sps, bool *longterm)
+{
+	bool field_pic = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
+	u8 cur_parity = (decode->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD) ?
+		V4L2_H264_BOTTOM_FIELD_REF : V4L2_H264_TOP_FIELD_REF;
+	int max_frame_num = 1 << (sps->log2_max_frame_num_minus4 + 4);
+	s32 n;
+
+	*longterm = e->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
+	n = e->frame_num;	/* long term: LongTermFrameIdx */
+	if (!*longterm && e->frame_num > decode->frame_num)
+		n -= max_frame_num;	/* FrameNumWrap */
+	if (!field_pic)
+		return n;
+	return fields == cur_parity ? 2 * n + 1 : 2 * n;
+}
+
+/* 8.2.4.3: apply the slice's modification commands to one list. */
+static void histb_h264_modify_list(struct v4l2_h264_reference *list,
+		unsigned int num_active, const struct histb_h264_mod *mods,
+		unsigned int num_mods,
+		const struct v4l2_ctrl_h264_decode_params *decode,
+		const struct v4l2_ctrl_h264_sps *sps)
+{
+	bool field_pic = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
+	s32 max_pic_num = (1 << (sps->log2_max_frame_num_minus4 + 4)) <<
+			  (field_pic ? 1 : 0);
+	s32 curr_pic_num = field_pic ? 2 * decode->frame_num + 1 : decode->frame_num;
+	s32 pred = curr_pic_num;
+	unsigned int idx = 0, m, c, d, n;
+
+	for (m = 0; m < num_mods && idx < num_active; m++) {
+		bool want_long = mods[m].idc == 2;
+		s32 target;
+		struct v4l2_h264_reference found = { };
+		bool have = false;
+
+		if (!want_long) {
+			s32 diff = mods[m].val + 1, nowrap;
+
+			if (mods[m].idc == 0) {
+				nowrap = pred - diff;
+				if (nowrap < 0)
+					nowrap += max_pic_num;
+			} else {
+				nowrap = pred + diff;
+				if (nowrap >= max_pic_num)
+					nowrap -= max_pic_num;
+			}
+			pred = nowrap;
+			target = nowrap > curr_pic_num ? nowrap - max_pic_num : nowrap;
+		} else {
+			target = mods[m].val;
+		}
+		for (d = 0; d < V4L2_H264_NUM_DPB_ENTRIES && !have; d++) {
+			const struct v4l2_h264_dpb_entry *e = &decode->dpb[d];
+			u8 f;
+
+			if (!(e->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
+				continue;
+			for (f = V4L2_H264_TOP_FIELD_REF; f <= V4L2_H264_BOTTOM_FIELD_REF && !have; f++) {
+				bool lt;
+				u8 fields = field_pic ? f : V4L2_H264_FRAME_REF;
+				s32 num;
+
+				if ((!field_pic && f != V4L2_H264_TOP_FIELD_REF) ||
+				    (field_pic && !(e->fields & f)))
+					continue;
+				num = histb_h264_ref_num(e, fields, decode, sps, &lt);
+				if (lt == want_long && num == target) {
+					found.index = d;
+					found.fields = fields;
+					have = true;
+				}
+			}
+		}
+		if (!have)
 			continue;
-		b->size = i ? histb_vdec_buffer_sizes[index[i]] : SZ_64K;
-		b->cpu = dma_alloc_coherent(dev, b->size, &b->dma, GFP_KERNEL);
-		if (!b->cpu)
-			return -ENOMEM;
-		memset(b->cpu, 0, b->size);
+		for (c = num_active; c > idx; c--)
+			list[c] = list[c - 1];
+		list[idx++] = found;
+		n = idx;
+		for (c = idx; c <= num_active; c++) {
+			const struct v4l2_h264_dpb_entry *e = &decode->dpb[list[c].index];
+			bool lt = false;
+			s32 num = histb_h264_ref_num(e, list[c].fields, decode, sps, &lt);
+
+			if (list[c].fields && lt == want_long && num == target)
+				continue;
+			list[n++] = list[c];
+		}
 	}
-	return 0;
 }
 
-static bool histb_vdec_mpeg1_capture_ready(struct histb_vdec_ctx *ctx)
+static void histb_h264_build_ref_lists(struct histb_h264_hdr *h,
+		const struct v4l2_ctrl_h264_decode_params *decode,
+		const struct v4l2_ctrl_h264_sps *sps)
 {
-	return vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)) &&
-		v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) &&
-		ctx->mpeg1->capture_configured;
-}
+	struct v4l2_ctrl_h264_slice_params *s = &h->slice;
+	struct v4l2_h264_reflist_builder b;
+	struct v4l2_h264_reference l0[V4L2_H264_REF_LIST_LEN + 1] = { };
+	struct v4l2_h264_reference l1[V4L2_H264_REF_LIST_LEN + 1] = { };
+	unsigned int n0 = s->num_ref_idx_l0_active_minus1 + 1;
+	unsigned int n1 = s->num_ref_idx_l1_active_minus1 + 1;
+	unsigned int i, valid;
 
-static void histb_vdec_mpeg1_update_format(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-	const struct v4l2_ctrl_mpeg2_sequence *s = &mp->decoder.sequence.control;
-	struct v4l2_event event = { .type = V4L2_EVENT_SOURCE_CHANGE };
-	unsigned int i;
-
-	/* All old-geometry display holds have been consumed before this point. */
-	for (i = 0; i < HISTB_MPEG1_SLOTS; i++)
-		histb_vdec_free_decoded_buffers(ctx, &mp->surface[i]);
-	ctx->src.pix.width = s->horizontal_size;
-	ctx->src.pix.height = s->vertical_size;
-	ctx->hevc_main10 = false;
-	if (!vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx))) {
-		ctx->dst.pix.width = ctx->src.pix.width;
-		ctx->dst.pix.height = ctx->src.pix.height;
-		histb_vdec_try_capture_format(ctx, &ctx->dst.pix);
+	if (s->slice_type != V4L2_H264_SLICE_TYPE_P &&
+	    s->slice_type != V4L2_H264_SLICE_TYPE_SP &&
+	    s->slice_type != V4L2_H264_SLICE_TYPE_B)
+		return;
+	v4l2_h264_init_reflist_builder(&b, decode, sps, decode->dpb);
+	valid = b.num_valid;
+	if (s->slice_type == V4L2_H264_SLICE_TYPE_B)
+		v4l2_h264_build_b_ref_lists(&b, l0, l1);
+	else
+		v4l2_h264_build_p_ref_list(&b, l0);
+	/* A list shorter than num_ref_idx_active repeats its first entry. */
+	for (i = valid; i < n0 + 1 && i < ARRAY_SIZE(l0); i++)
+		l0[i] = valid ? l0[0] : l0[i];
+	histb_h264_modify_list(l0, n0, h->mods[0], h->num_mods[0], decode, sps);
+	for (i = 0; i < n0; i++)
+		s->ref_pic_list0[i] = l0[i];
+	if (s->slice_type == V4L2_H264_SLICE_TYPE_B) {
+		for (i = valid; i < n1 + 1 && i < ARRAY_SIZE(l1); i++)
+			l1[i] = valid ? l1[0] : l1[i];
+		histb_h264_modify_list(l1, n1, h->mods[1], h->num_mods[1], decode, sps);
+		for (i = 0; i < n1; i++)
+			s->ref_pic_list1[i] = l1[i];
 	}
-	mp->capture_configured = false;
-	mp->source_change = false;
-	event.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
-	v4l2_event_queue_fh(&ctx->fh, &event);
 }
 
-static int histb_vdec_mpeg1_parse_source(struct histb_vdec_ctx *ctx,
-				      struct vb2_v4l2_buffer *src)
+/* Position of the next 00 00 01 at or after pos; returns size when none. */
+static size_t histb_h264_find_start(const u8 *d, size_t size, size_t pos)
 {
-	struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-	struct histb_vdec_dma_buffer *stream = &ctx->bitstream;
-	struct device *dev = ctx->vdec->dev;
-	u32 used = vb2_get_plane_payload(&src->vb2_buf, 0);
-	u32 offset = src->vb2_buf.planes[0].data_offset;
-	bool first = !mp->decoder.sequence_valid;
-	size_t size;
-	void *data;
+	for (; pos + 3 <= size; pos++)
+		if (!d[pos] && !d[pos + 1] && d[pos + 2] == 1)
+			return pos;
+	return size;
+}
+
+static bool histb_vdec_h264_frame_based(struct histb_vdec_ctx *ctx)
+{
+	struct v4l2_ctrl *c = v4l2_ctrl_find(&ctx->ctrl_handler,
+					     V4L2_CID_STATELESS_H264_DECODE_MODE);
+
+	return c && c->cur.val == V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED;
+}
+
+/*
+ * Stage ONE slice (src bytes [src_off, src_off + nal_size)) for the hardware:
+ * validate, start the picture on its first slice, append the NAL to the
+ * stream buffer and write its messages.  Shared by the SLICE_BASED path (one
+ * request per slice) and the FRAME_BASED path (a loop over the unit).
+ */
+static int histb_vdec_h264_stage_slice(struct histb_vdec_ctx *ctx,
+		struct histb_vdec_decoded_buffer *decoded,
+		struct vb2_v4l2_buffer *src, size_t src_off,
+		unsigned long payload,
+		const struct v4l2_ctrl_h264_decode_params *decode,
+		const struct v4l2_ctrl_h264_sps *sps,
+		const struct v4l2_ctrl_h264_pps *pps,
+		const struct v4l2_ctrl_h264_scaling_matrix *scaling,
+		const struct v4l2_ctrl_h264_slice_params *slice,
+		const struct v4l2_ctrl_h264_pred_weights *pred_weights,
+		bool last_slice, u32 *total_mbs_out)
+{
+	dma_addr_t src_dma;
+	u32 tail_bits, total_mbs;
 	int ret;
 
-	if (offset > used || used - offset > HISTB_MPEG1_MAX_BYTES)
-		return -EINVAL;
-	used -= offset;
-	if (!used) {
-		mp->drain = true;
-		mp->eos = true;
-		return 0;
-	}
-	data = vb2_plane_vaddr(&src->vb2_buf, 0);
-	if (!data)
-		return -EFAULT;
-	size = ALIGN(used + SZ_4K, SZ_64K);
-	if (!stream->cpu || stream->size < size) {
-		histb_vdec_free_dma_buffer(dev, stream, false);
-		stream->size = size;
-		stream->cpu = dma_alloc_coherent(dev, size, &stream->dma, GFP_KERNEL);
-		if (!stream->cpu)
-			return -ENOMEM;
-	}
-	memcpy(stream->cpu, data + offset, used);
-	memset(stream->cpu + used, 0, SZ_4K);
-	ret = histb_mpeg1_parse(&mp->decoder, stream->cpu, used, &mp->au);
-	if (ret < 0)
+	ctx->h264_new_frame =
+		!ctx->h264_partial && slice && !slice->first_mb_in_slice;
+	ctx->h264_last_slice = last_slice;
+	ctx->h264_first_mb = slice ? slice->first_mb_in_slice : 0;
+	ret = histb_vdec_validate_h264(ctx, decode, sps, pps, slice,
+				      pred_weights, payload, ctx->h264_new_frame);
+	if (ret)
 		return ret;
-	mp->au_valid = ret > 0;
-	if (mp->au.sequence_present &&
-	    (first || ctx->src.pix.width != mp->au.sequence.control.horizontal_size ||
-	     ctx->src.pix.height != mp->au.sequence.control.vertical_size))
-		mp->source_change = true;
-	if (mp->au.reset_before || mp->source_change) {
-		if (histb_mpeg1_busy_slots(&mp->decoder)) {
-			mp->drain = true;
-		} else {
-			histb_mpeg1_clear_dpb(&mp->decoder);
-			if (mp->source_change)
-				histb_vdec_mpeg1_update_format(ctx);
-		}
+	if (ctx->h264_slices >= HISTB_VDEC_H264_MAX_SLICES)
+		return -E2BIG;
+	if (ctx->h264_new_frame) {
+		ctx->h264_pictures++;
+		ret = histb_vdec_begin_h264_picture(
+			ctx, decoded, src->vb2_buf.timestamp, decode, sps);
+		if (ret)
+			return ret;
 	}
-	if (!ret && mp->au.sequence_end)
-		mp->drain = true;
-	return ret;
-}
-
-static void histb_vdec_mpeg1_finish_drain(struct histb_vdec_ctx *ctx,
-					struct vb2_v4l2_buffer *last)
-{
-	struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-
-	histb_mpeg1_clear_dpb(&mp->decoder);
-	mp->drain = false;
-	if (mp->eos) {
-		v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
-		if (last) {
-			last->flags |= V4L2_BUF_FLAG_LAST;
-			v4l2_event_queue_fh(&ctx->fh, &histb_vdec_eos_event);
-		} else {
-			histb_vdec_complete_empty_last(ctx);
-		}
-		mp->eos = false;
-	}
-	if (mp->source_change)
-		histb_vdec_mpeg1_update_format(ctx);
-}
-
-static void histb_vdec_mpeg1_emit(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-	struct vb2_v4l2_buffer *dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-	int ret;
-
-	if (!dst || !mp->output_valid)
-		return;
-	mp->output_slot = mp->output.slot;
-	ret = histb_vdec_copy_capture(ctx, dst);
-	mp->output_slot = -1;
-	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-	dst->vb2_buf.timestamp = mp->output.timestamp;
-	dst->sequence = ctx->dst.sequence++;
-	dst->field = V4L2_FIELD_NONE;
-	dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
-			V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_LAST);
-	dst->flags |= mp->output.type == V4L2_MPEG2_PIC_CODING_TYPE_I ?
-		V4L2_BUF_FLAG_KEYFRAME : mp->output.type == V4L2_MPEG2_PIC_CODING_TYPE_B ?
-		V4L2_BUF_FLAG_BFRAME : V4L2_BUF_FLAG_PFRAME;
-	vb2_set_plane_payload(&dst->vb2_buf, 0, ret ? 0 : ctx->dst.pix.sizeimage);
-	mp->output_valid = histb_mpeg1_next_output(&mp->decoder, mp->drain,
-						 &mp->output) > 0;
-	if (mp->drain && !mp->output_valid)
-		histb_vdec_mpeg1_finish_drain(ctx, dst);
-	v4l2_m2m_buf_done(dst, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-}
-
-static void histb_vdec_run_mpeg1(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_dev *vdec = ctx->vdec;
-	struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
-	struct vb2_v4l2_buffer *src;
-	struct histb_mpeg1_surface surface[HISTB_MPEG1_SLOTS] = { };
-	struct histb_vdec_dma_buffer *msg = &ctx->buffers[HISTB_VDEC_BUF_MSG];
-	struct histb_vdec_decoded_buffer *decoded;
-	unsigned long flags;
-	unsigned int i, slot;
-	u16 busy;
-	bool prepared = false, powered = false;
-	int ret = 0;
-
-	mutex_lock(&mp->lock);
-	src = v4l2_m2m_next_src_buf(m2m);
-	if (READ_ONCE(mp->aborted))
-		goto finish;
-	if (mp->output_valid) {
-		histb_vdec_mpeg1_emit(ctx);
-		goto finish;
-	}
-	if (mp->drain) {
-		mp->output_valid = histb_mpeg1_next_output(&mp->decoder, true,
-							 &mp->output) > 0;
-		if (mp->output_valid) {
-			histb_vdec_mpeg1_emit(ctx);
-			goto finish;
-		}
-		histb_vdec_mpeg1_finish_drain(ctx, NULL);
-		goto finish;
-	}
-	if (!src)
-		goto finish;
-	if (!mp->au_valid) {
-		ret = histb_vdec_mpeg1_parse_source(ctx, src);
-		if (ret <= 0)
-			goto source_done;
-	}
-	if (mp->drain || !histb_vdec_mpeg1_capture_ready(ctx))
-		goto finish;
-	ctx->avs = false;
-	ctx->hevc = false;
-	ctx->mpeg2 = true;
-	ctx->mpeg4 = false;
-	ctx->vc1 = false;
-	ctx->vp8 = false;
-	ctx->vp9 = false;
-	ctx->hevc_main10 = false;
-	busy = histb_mpeg1_busy_slots(&mp->decoder);
-	for (slot = 0; slot < HISTB_MPEG1_SLOTS; slot++)
-		if (!(busy & BIT(slot)))
-			break;
-	ret = histb_mpeg1_prepare(&mp->decoder, &mp->au, slot,
-				 src->vb2_buf.timestamp, &mp->job);
-	if (ret == -EPIPE) {
-		mp->drain = true;
-		goto finish;
-	}
-	if (ret)
-		goto source_done;
-	prepared = true;
-	decoded = &mp->surface[slot];
-	ret = histb_vdec_set_decoded_buffer_sizes(ctx, decoded);
-	if (!ret)
-		ret = histb_vdec_alloc_decoded_buffers(ctx, decoded);
-	if (ret)
-		goto source_done;
-	for (i = 0; i < HISTB_MPEG1_SLOTS; i++) {
-		surface[i].luma = lower_32_bits(mp->surface[i].tile.dma);
-		surface[i].pmv = lower_32_bits(mp->surface[i].pmv.dma);
-		histb_vdec_sync_tile_for_device(ctx, &mp->surface[i]);
-	}
-	memset(msg->cpu, 0, msg->size);
-	ret = histb_mpeg1_build_messages(&mp->job, surface,
-		lower_32_bits(ctx->bitstream.dma), lower_32_bits(msg->dma + SZ_8K),
-		lower_32_bits(histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_PMV_TOP)),
-		msg->cpu + SZ_4K, msg->cpu + SZ_8K);
-	if (ret)
-		goto source_done;
-	ctx->total_mbs = DIV_ROUND_UP(ctx->src.pix.width, 16) *
-		DIV_ROUND_UP(ctx->src.pix.height, 16);
-	ret = pm_runtime_resume_and_get(vdec->dev);
-	if (ret < 0)
-		goto source_done;
-	powered = true;
-	ret = histb_vdec_configure_vdh_clock(vdec);
-	if (ret)
-		goto source_done;
-	reinit_completion(&mp->done);
-	mp->state = mp->smmu_secure = mp->smmu_nonsecure = 0;
-	mutex_lock(&vdec->launch_lock);
-	if (mp->aborted) {
-		mutex_unlock(&vdec->launch_lock);
-		ret = -ECANCELED;
-		goto source_done;
-	}
-	spin_lock_irqsave(&vdec->irqlock, flags);
-	vdec->curr_ctx = ctx;
-	vdec->phase = HISTB_VDEC_PHASE_VDH;
-	spin_unlock_irqrestore(&vdec->irqlock, flags);
-	histb_vdec_start_v5r6(ctx, msg->dma + SZ_4K, msg->dma,
-		ctx->bitstream.dma, decoded->tile.dma,
-		0x41400000 | (ctx->total_mbs - 1), 0x00034003);
-	mutex_unlock(&vdec->launch_lock);
-	if (!wait_for_completion_timeout(&mp->done,
-			msecs_to_jiffies(HISTB_VDEC_WATCHDOG_MS)))
-		ret = -ETIMEDOUT;
-	else if (READ_ONCE(mp->aborted) || mp->smmu_secure || mp->smmu_nonsecure ||
-		 !histb_vdec_v5r6_report_valid(ctx, mp->state, msg->cpu))
-		ret = -EIO;
-	mutex_lock(&vdec->launch_lock);
-	if (ret)
-		histb_v5r6_reset(vdec->regs);
-	spin_lock_irqsave(&vdec->irqlock, flags);
-	vdec->curr_ctx = NULL;
-	vdec->phase = HISTB_VDEC_PHASE_IDLE;
-	vdec->jobs++;
-	if (ret)
-		vdec->errors++;
-	spin_unlock_irqrestore(&vdec->irqlock, flags);
-	mutex_unlock(&vdec->launch_lock);
-	synchronize_irq(vdec->irq);
-source_done:
-	if (ret)
-		dev_err_ratelimited(vdec->dev, "MPEG1 AU failed: %d state=%08x\n",
-				    ret, prepared ? mp->state : 0);
-	if (prepared)
-		histb_mpeg1_complete(&mp->decoder, &mp->job, !ret);
-	if (powered) {
-		pm_runtime_mark_last_busy(vdec->dev);
-		pm_runtime_put_autosuspend(vdec->dev);
-	}
-	if (prepared && mp->au.sequence_end)
-		mp->drain = true;
-	mp->au_valid = false;
-	if (src) {
-		if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
-			mp->drain = true;
-			mp->eos = true;
-		}
-		src = v4l2_m2m_src_buf_remove(m2m);
-		src->sequence = ctx->src.sequence++;
-		v4l2_m2m_buf_done(src, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-	}
-	mp->output_valid = histb_mpeg1_next_output(&mp->decoder, mp->drain,
-						 &mp->output) > 0;
-	if (!READ_ONCE(mp->aborted) && mp->output_valid &&
-	    histb_vdec_mpeg1_capture_ready(ctx))
-		histb_vdec_mpeg1_emit(ctx);
-finish:
-	/* Abort waits this mutex: publish m2m completion before releasing it. */
-	v4l2_m2m_job_finish(vdec->m2m_dev, m2m);
-	mutex_unlock(&mp->lock);
-}
-
-static void histb_vdec_avs2_free(struct histb_vdec_ctx *ctx)
-{
-	unsigned int i;
-
-	if (!ctx->avs2)
-		return;
-	for (i = 0; i < HISTB_AVS2_SLOTS; i++)
-		histb_vdec_free_decoded_buffers(ctx, &ctx->avs2->surface[i]);
-	kfree(ctx->avs2);
-	ctx->avs2 = NULL;
-}
-
-static int histb_vdec_avs2_alloc(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_dma_buffer *message = &ctx->buffers[HISTB_VDEC_BUF_MSG];
-	struct histb_vdec_dma_buffer *scratch = &ctx->buffers[HISTB_VDEC_BUF_RCN_TOP];
-	struct device *dev = ctx->vdec->dev;
-
-	if (!ctx->avs2) {
-		ctx->avs2 = kzalloc(sizeof(*ctx->avs2), GFP_KERNEL);
-		if (!ctx->avs2)
-			return -ENOMEM;
-		histb_avs2_init(&ctx->avs2->decoder);
-		mutex_init(&ctx->avs2->lock);
-		init_completion(&ctx->avs2->done);
-		ctx->avs2->output_slot = -1;
-	}
-	if (!message->cpu) {
-		message->size = SZ_64K;
-		message->cpu = dma_alloc_coherent(dev, message->size,
-						 &message->dma, GFP_KERNEL);
-		if (!message->cpu)
-			return -ENOMEM;
-	}
-	if (!scratch->cpu) {
-		scratch->size = 0x17400;
-		scratch->cpu = dma_alloc_coherent(dev, scratch->size,
-						 &scratch->dma, GFP_KERNEL);
-		if (!scratch->cpu)
-			return -ENOMEM;
-		memset(scratch->cpu, 0, scratch->size);
-	}
-	return 0;
-}
-
-static bool histb_vdec_avs2_capture_ready(struct histb_vdec_ctx *ctx)
-{
-	return vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)) &&
-		v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) &&
-		(ctx->avs2->capture_configured ||
-		 (ctx->dst.pix.width == ctx->src.pix.width &&
-		  ctx->dst.pix.height == ctx->src.pix.height));
-}
-
-static int histb_vdec_job_ready(void *priv)
-{
-	struct histb_vdec_ctx *ctx = priv;
-	struct histb_vdec_avs2 *avs = ctx->avs2;
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1) {
-		struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-
-		if (!mp || READ_ONCE(mp->aborted) ||
-		    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
-			return 0;
-		if (mp->output_valid || mp->drain)
-			return histb_vdec_mpeg1_capture_ready(ctx);
-		return v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) &&
-			(!mp->au_valid || histb_vdec_mpeg1_capture_ready(ctx));
-	}
-
-	if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_AVS2)
-		return 1;
-	if (!avs)
-		return 0;
-	if (v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
-		return 0;
-	if (avs->output_valid || avs->drain)
-		return histb_vdec_avs2_capture_ready(ctx);
-	if (!v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx))
-		return 0;
-	return !avs->au_valid || histb_vdec_avs2_capture_ready(ctx);
-}
-
-static void histb_vdec_avs2_update_format(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_avs2 *avs = ctx->avs2;
-	const struct histb_avs2_sequence *sequence = &avs->decoder.sequence;
-	struct v4l2_event event = { .type = V4L2_EVENT_SOURCE_CHANGE };
-	unsigned int i;
-
-	/* Old pictures must be displayed using their old geometry before this. */
-	for (i = 0; i < HISTB_AVS2_SLOTS; i++)
-		histb_vdec_free_decoded_buffers(ctx, &avs->surface[i]);
-	ctx->src.pix.width = sequence->width;
-	ctx->src.pix.height = sequence->height;
-	ctx->hevc_main10 = sequence->bit_depth == 10;
-	if (!vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx))) {
-		ctx->dst.pix.width = ctx->src.pix.width;
-		ctx->dst.pix.height = ctx->src.pix.height;
-		histb_vdec_try_capture_format(ctx, &ctx->dst.pix);
-	}
-	event.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
-	avs->capture_configured = false;
-	v4l2_event_queue_fh(&ctx->fh, &event);
-	avs->source_change = false;
-}
-
-static int histb_vdec_avs2_parse_source(struct histb_vdec_ctx *ctx,
-					     struct vb2_v4l2_buffer *src)
-{
-	struct histb_vdec_avs2 *avs = ctx->avs2;
-	struct histb_vdec_dma_buffer *stream = &ctx->bitstream;
-	struct device *dev = ctx->vdec->dev;
-	bool first = !avs->decoder.sequence_valid;
-	u32 old_width = ctx->src.pix.width, old_height = ctx->src.pix.height;
-	u32 used = vb2_get_plane_payload(&src->vb2_buf, 0);
-	u32 offset = src->vb2_buf.planes[0].data_offset;
-	size_t size;
-	void *data;
-	int ret;
-
-	if (offset > used || used - offset > HISTB_VDEC_MAX_BITSTREAM - SZ_4K)
+	if (!histb_vdec_dma_buffers_valid(ctx))
 		return -EINVAL;
-	used -= offset;
-	if (!used) {
-		avs->drain = true;
-		avs->eos = true;
-		return 0;
-	}
-	data = vb2_plane_vaddr(&src->vb2_buf, 0);
-	if (!data)
-		return -EFAULT;
-	size = ALIGN(used + SZ_4K, SZ_64K);
-	if (!stream->cpu || stream->size < size) {
-		histb_vdec_free_dma_buffer(dev, stream, false);
-		stream->size = size;
-		stream->cpu = dma_alloc_coherent(dev, size, &stream->dma, GFP_KERNEL);
-		if (!stream->cpu)
-			return -ENOMEM;
-	}
-	memcpy(stream->cpu, data + offset, used);
-	memset(stream->cpu + used, 0, SZ_4K);
-	ret = histb_avs2_parse(&avs->decoder, stream->cpu, used, &avs->au);
-	if (ret < 0)
+	ret = histb_vdec_append_h264_bitstream(ctx, src, src_off, &payload,
+					       &src_dma, &tail_bits);
+	if (ret)
 		return ret;
-	if (avs->au.sequence_present &&
-	    (first || old_width != avs->au.sequence.width ||
-	     old_height != avs->au.sequence.height ||
-	     ctx->hevc_main10 != (avs->au.sequence.bit_depth == 10))) {
-		avs->source_change = true;
-		if (histb_avs2_busy_slots(&avs->decoder)) {
-			avs->drain = true;
-			avs->barrier = true;
-		} else {
-			histb_vdec_avs2_update_format(ctx);
-		}
-	}
-	if (ret) {
-		avs->au_valid = true;
-		if (avs->au.reset_before && histb_avs2_busy_slots(&avs->decoder)) {
-			avs->drain = true;
-			avs->barrier = true;
-		}
-	} else if (avs->au.sequence_end || avs->au.video_edit) {
-		avs->drain = true;
-		avs->barrier = true;
-	}
-	return ret;
-}
-
-static void histb_vdec_avs2_emit(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_avs2 *avs = ctx->avs2;
-	struct vb2_v4l2_buffer *dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-	int ret;
-
-	if (!dst || !avs->output_valid)
-		return;
-	avs->output_slot = avs->output.slot;
-	ret = histb_vdec_copy_capture(ctx, dst);
-	avs->output_slot = -1;
-	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-	dst->vb2_buf.timestamp = avs->output.timestamp;
-	dst->sequence = ctx->dst.sequence++;
-	dst->field = !avs->output.structure ?
-		(avs->output.top_field ? V4L2_FIELD_TOP : V4L2_FIELD_BOTTOM) :
-		avs->output.progressive ? V4L2_FIELD_NONE :
-		(avs->output.top_first ? V4L2_FIELD_INTERLACED_TB :
-		 V4L2_FIELD_INTERLACED_BT);
-	dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
-			V4L2_BUF_FLAG_BFRAME);
-	dst->flags |= avs->output.type == HISTB_AVS2_I ? V4L2_BUF_FLAG_KEYFRAME :
-		avs->output.type == HISTB_AVS2_B ? V4L2_BUF_FLAG_BFRAME :
-		V4L2_BUF_FLAG_PFRAME;
-	vb2_set_plane_payload(&dst->vb2_buf, 0, ret ? 0 : ctx->dst.pix.sizeimage);
-	avs->output_valid = histb_avs2_next_output(&avs->decoder, avs->drain,
-						 &avs->output) > 0;
-	if (avs->drain && !avs->output_valid) {
-		histb_avs2_clear_dpb(&avs->decoder);
-		avs->drain = false;
-		avs->barrier = false;
-		if (avs->eos) {
-			dst->flags |= V4L2_BUF_FLAG_LAST;
-			v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
-			v4l2_event_queue_fh(&ctx->fh, &histb_vdec_eos_event);
-			avs->eos = false;
-		}
-		if (avs->source_change)
-			histb_vdec_avs2_update_format(ctx);
-	}
-	v4l2_m2m_buf_done(dst, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-}
-
-static void histb_vdec_run_avs2(struct histb_vdec_ctx *ctx)
-{
-	struct histb_vdec_dev *vdec = ctx->vdec;
-	struct histb_vdec_avs2 *avs = ctx->avs2;
-	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
-	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(m2m);
-	struct histb_avs2_surface surfaces[HISTB_AVS2_SLOTS] = { };
-	struct histb_avs2_scratch scratch;
-	struct histb_vdec_decoded_buffer *decoded;
-	struct histb_vdec_dma_buffer *msg = &ctx->buffers[HISTB_VDEC_BUF_MSG];
-	u32 *picture = msg->cpu + SZ_4K, *slices = msg->cpu + SZ_8K;
-	u32 base = ALIGN(histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_RCN_TOP), SZ_1K);
-	u32 stride, height, lcuw, lcuh;
-	unsigned long flags;
-	u16 busy;
-	size_t tile_size, pmv_size;
-	unsigned int slot, i;
-	bool prepared = false, powered = false;
-	int ret = 0;
-
-	mutex_lock(&avs->lock);
-	if (avs->output_valid) {
-		histb_vdec_avs2_emit(ctx);
-		goto finish;
-	}
-	if (avs->drain) {
-		avs->output_valid = histb_avs2_next_output(&avs->decoder, true,
-							 &avs->output) > 0;
-		if (avs->output_valid) {
-			histb_vdec_avs2_emit(ctx);
-			goto finish;
-		}
-		histb_avs2_clear_dpb(&avs->decoder);
-		avs->drain = false;
-		avs->barrier = false;
-		if (avs->eos) {
-			v4l2_m2m_mark_stopped(m2m);
-			histb_vdec_complete_empty_last(ctx);
-			avs->eos = false;
-			goto finish;
-		}
-		if (avs->source_change)
-			histb_vdec_avs2_update_format(ctx);
-	}
-	if (!src)
-		goto finish;
-	if (!avs->au_valid) {
-		ret = histb_vdec_avs2_parse_source(ctx, src);
-		if (ret <= 0)
-			goto source_done;
-	}
-	if (avs->drain || !histb_vdec_avs2_capture_ready(ctx))
-		goto finish;
-	ctx->avs = false;
+	/* CABAC retains rbsp_stop_one_bit and removes trailing zero bits. */
+	if (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
+		tail_bits--;
+	ret = histb_vdec_prepare_messages(ctx, decoded, decode, sps, pps,
+					  scaling, slice, pred_weights,
+					  ctx->bitstream.dma, src_dma,
+					  payload, tail_bits, ctx->h264_slices,
+					  ctx->h264_new_frame,
+					  ctx->h264_new_surface);
+	if (ret)
+		return ret;
+	total_mbs = (sps->pic_width_in_mbs_minus1 + 1) *
+		    (sps->pic_height_in_map_units_minus1 + 1);
+	if (!(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
+	    !(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
+		total_mbs *= 2;
+	ctx->total_mbs = total_mbs;
+	*total_mbs_out = total_mbs;
+	ctx->frame_flags = decode->flags;
 	ctx->hevc = false;
+	ctx->hevc_main10 = false;
+	ctx->hevc_scaling_list = false;
+	ctx->hevc_slices = 0;
 	ctx->mpeg2 = false;
-	ctx->mpeg4 = false;
-	ctx->vc1 = false;
+	ctx->mpeg2_slices = 0;
 	ctx->vp8 = false;
-	ctx->vp9 = false;
-	ctx->hevc_main10 = avs->au.sequence.bit_depth == 10;
-	busy = histb_avs2_busy_slots(&avs->decoder);
-	for (slot = 0; slot < HISTB_AVS2_SLOTS; slot++)
-		if (!(busy & BIT(slot)))
-			break;
-	if (slot == HISTB_AVS2_SLOTS)
-		slot = 0; /* prepare() can still reuse the existing GB picture. */
-	ret = histb_avs2_prepare(&avs->decoder, &avs->au, slot,
-			       src->vb2_buf.timestamp, &avs->job);
-	if (ret == -EPIPE) {
-		avs->drain = true;
-		avs->barrier = true;
-		goto finish;
-	}
-	if (ret)
-		goto source_done;
-	prepared = true;
-	decoded = &avs->surface[avs->job.slot];
-	stride = ALIGN(avs->au.sequence.width, 256);
-	height = ALIGN(avs->au.sequence.height, 64);
-	tile_size = stride * height * 3 / 2 +
-		(ctx->hevc_main10 ? (stride / 4) * height * 3 / 2 : 0) + 0x420;
-	pmv_size = ALIGN((ALIGN(avs->au.sequence.width, 64) >> 4) *
-		(height >> 4) * 16 + 0x100, 128);
-	if ((decoded->tile.cpu && decoded->tile.size != tile_size) ||
-	    (decoded->pmv.cpu && decoded->pmv.size != pmv_size))
-		histb_vdec_free_decoded_buffers(ctx, decoded);
-	decoded->tile.size = tile_size;
-	decoded->pmv.size = pmv_size;
-	ret = histb_vdec_alloc_decoded_buffers(ctx, decoded);
-	if (ret)
-		goto source_done;
-	for (i = 0; i < HISTB_AVS2_SLOTS; i++) {
-		surfaces[i].luma = lower_32_bits(avs->surface[i].tile.dma);
-		surfaces[i].pmv = lower_32_bits(avs->surface[i].pmv.dma);
-		histb_vdec_sync_tile_for_device(ctx, &avs->surface[i]);
-	}
-	scratch = (struct histb_avs2_scratch) {
-		.sed_top = base, .pmv_top = base + 0x1000,
-		.rcn_top = base + 0x4000, .dblk_top = base + 0x7000,
-		.sao_top = base + 0x13000,
-		.slices = lower_32_bits(msg->dma + SZ_8K),
-	};
-	memset(msg->cpu, 0, msg->size);
-	ret = histb_avs2_build_messages(&avs->job, surfaces, &scratch,
-				      lower_32_bits(ctx->bitstream.dma), picture, slices);
-	if (ret)
-		goto source_done;
-	for (i = 0; i < HISTB_AVS2_PIC_WORDS; i++)
-		((__le32 *)picture)[i] = cpu_to_le32(picture[i]);
-	for (i = 0; i < avs->au.slice_count * HISTB_AVS2_SLICE_WORDS; i++)
-		((__le32 *)slices)[i] = cpu_to_le32(slices[i]);
-	lcuw = DIV_ROUND_UP(avs->au.sequence.width, 1U << avs->au.sequence.lcu_log2);
-	lcuh = DIV_ROUND_UP(avs->au.sequence.height, 1U << avs->au.sequence.lcu_log2);
-	ctx->total_mbs = lcuw * lcuh;
-	ret = pm_runtime_resume_and_get(vdec->dev);
-	if (ret < 0)
-		goto source_done;
-	powered = true;
-	ret = histb_vdec_configure_vdh_clock(vdec);
-	if (ret)
-		goto source_done;
-	reinit_completion(&avs->done);
-	avs->aborted = false;
-	mutex_lock(&vdec->launch_lock);
-	spin_lock_irqsave(&vdec->irqlock, flags);
-	vdec->curr_ctx = ctx;
-	vdec->phase = HISTB_VDEC_PHASE_VDH;
-	spin_unlock_irqrestore(&vdec->irqlock, flags);
-	histb_vdec_start_v5r6(ctx, msg->dma + SZ_4K, msg->dma,
-		ctx->bitstream.dma, decoded->tile.dma,
-		BIT(30) | (ctx->total_mbs - 1), 0x0003c00f);
-	mutex_unlock(&vdec->launch_lock);
-	if (!wait_for_completion_timeout(&avs->done,
-			msecs_to_jiffies(HISTB_VDEC_WATCHDOG_MS)))
-		ret = -ETIMEDOUT;
-	else if (avs->aborted || avs->smmu_secure || avs->smmu_nonsecure ||
-		 !histb_vdec_v5r6_report_valid(ctx, avs->state, msg->cpu))
-		ret = -EIO;
-	mutex_lock(&vdec->launch_lock);
-	if (ret)
-		histb_v5r6_reset(vdec->regs);
-	spin_lock_irqsave(&vdec->irqlock, flags);
-	vdec->curr_ctx = NULL;
-	vdec->phase = HISTB_VDEC_PHASE_IDLE;
-	spin_unlock_irqrestore(&vdec->irqlock, flags);
-	mutex_unlock(&vdec->launch_lock);
-source_done:
-	if (ret)
-		dev_err_ratelimited(vdec->dev, "AVS2 AU failed: %d state=%08x\n",
-				    ret, prepared ? avs->state : 0);
-	if (prepared)
-		histb_avs2_complete(&avs->decoder, &avs->job, !ret);
-	if (powered) {
-		pm_runtime_mark_last_busy(vdec->dev);
-		pm_runtime_put_autosuspend(vdec->dev);
-	}
-	if (ret || prepared)
-		avs->au_valid = false;
-	if (src) {
-		if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
-			avs->drain = true;
-			avs->eos = true;
-		}
-		src = v4l2_m2m_src_buf_remove(m2m);
-		src->sequence = ctx->src.sequence++;
-		v4l2_m2m_buf_done(src, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-	}
-	avs->output_valid = histb_avs2_next_output(&avs->decoder, avs->drain,
-						 &avs->output) > 0;
-	if (avs->output_valid && histb_vdec_avs2_capture_ready(ctx))
-		histb_vdec_avs2_emit(ctx);
-finish:
-	mutex_unlock(&avs->lock);
-	v4l2_m2m_job_finish(vdec->m2m_dev, m2m);
+	ctx->cabac = pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
+	ctx->mbaff =
+		!(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
+		(sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD);
+	ctx->h264_slices++;
+	return 0;
 }
+
+/*
+ * FRAME_BASED: split the access unit, parse every slice header, and stage the
+ * slices one after the other.  The caller starts the hardware afterwards.
+ */
+static int histb_vdec_h264_run_frame(struct histb_vdec_ctx *ctx,
+		struct histb_vdec_decoded_buffer *decoded,
+		struct vb2_v4l2_buffer *src, unsigned long payload,
+		const struct v4l2_ctrl_h264_decode_params *decode_in,
+		const struct v4l2_ctrl_h264_sps *sps,
+		const struct v4l2_ctrl_h264_pps *pps,
+		const struct v4l2_ctrl_h264_scaling_matrix *scaling,
+		u32 *total_mbs)
+{
+	struct v4l2_ctrl_h264_decode_params *decode;
+	struct histb_h264_hdr *hdr;
+	struct {
+		size_t off, size;
+	} *nal;
+	u8 *hbuf;
+	const u8 *data;
+	size_t pos, end, next;
+	unsigned int n = 0, i;
+	bool any_p = false, any_b = false;
+	int ret = 0;
+
+	if (!decode_in || !sps || !pps || !scaling)
+		return -EINVAL;
+	data = vb2_plane_vaddr(&src->vb2_buf, 0);
+	if (!data)
+		return -EOPNOTSUPP;
+	data += src->vb2_buf.planes[0].data_offset;
+
+	decode = kmemdup(decode_in, sizeof(*decode), GFP_KERNEL);
+	hdr = kzalloc(sizeof(*hdr), GFP_KERNEL);
+	nal = kcalloc(HISTB_VDEC_H264_MAX_SLICES, sizeof(*nal), GFP_KERNEL);
+	hbuf = kmalloc(HISTB_H264_MAX_HDR_BYTES, GFP_KERNEL);
+	if (!decode || !hdr || !nal || !hbuf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* 1. split on 00 00 01; drop the zero bytes that belong to the next start code */
+	pos = histb_h264_find_start(data, payload, 0);
+	while (pos < payload) {
+		size_t start = pos + 3;
+
+		next = histb_h264_find_start(data, payload, start);
+		end = next;
+		while (end > start && !data[end - 1])
+			end--;
+		if (end > start && ((data[start] & 0x1f) == 1 || (data[start] & 0x1f) == 5)) {
+			if (n >= HISTB_VDEC_H264_MAX_SLICES) {
+				ret = -E2BIG;
+				goto out;
+			}
+			nal[n].off = start;
+			nal[n].size = end - start;
+			n++;
+		}
+		pos = next;
+	}
+	if (!n) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* 2. the picture is P/B when any slice is (the validation wants one answer) */
+	for (i = 0; i < n; i++) {
+		size_t hn = min_t(size_t, nal[i].size, HISTB_H264_MAX_HDR_BYTES);
+		size_t rn;
+
+		memcpy(hbuf, data + nal[i].off, hn);
+		rn = histb_vdec_ebsp_to_rbsp(hbuf, hn);
+		ret = histb_h264_parse_slice_header(hbuf, rn, sps, pps, decode, hdr);
+		if (ret)
+			goto out;
+		any_p |= hdr->slice.slice_type == V4L2_H264_SLICE_TYPE_P ||
+			 hdr->slice.slice_type == V4L2_H264_SLICE_TYPE_SP;
+		any_b |= hdr->slice.slice_type == V4L2_H264_SLICE_TYPE_B;
+	}
+	decode->flags &= ~(V4L2_H264_DECODE_PARAM_FLAG_PFRAME |
+			   V4L2_H264_DECODE_PARAM_FLAG_BFRAME);
+	if (any_b)
+		decode->flags |= V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
+	else if (any_p)
+		decode->flags |= V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
+
+	/* 3. stage slice by slice */
+	for (i = 0; i < n; i++) {
+		size_t hn = min_t(size_t, nal[i].size, HISTB_H264_MAX_HDR_BYTES);
+		size_t rn;
+
+		memcpy(hbuf, data + nal[i].off, hn);
+		rn = histb_vdec_ebsp_to_rbsp(hbuf, hn);
+		ret = histb_h264_parse_slice_header(hbuf, rn, sps, pps, decode, hdr);
+		if (ret)
+			goto out;
+		/*
+		 * header_bit_size is an RBSP position, and the stream is later
+		 * fed the same way as in SLICE_BASED mode, so it needs no EPB
+		 * adjustment here.
+		 */
+		histb_h264_build_ref_lists(hdr, decode, sps);
+		ret = histb_vdec_h264_stage_slice(ctx, decoded, src, nal[i].off,
+				nal[i].size, decode, sps, pps, scaling,
+				&hdr->slice, hdr->has_pw ? &hdr->pw : NULL,
+				i == n - 1, total_mbs);
+		if (ret)
+			goto out;
+		if (i != n - 1) {
+			ctx->h264_partial = true;
+			ctx->h264_last_first_mb = ctx->h264_first_mb;
+		}
+	}
+out:
+	kfree(hbuf);
+	kfree(nal);
+	kfree(hdr);
+	kfree(decode);
+	return ret;
+}
+
+
+/*
+ * h264_selfcheck=1: in SLICE_BASED mode also run the FRAME_BASED parser and
+ * reference-list builder on each slice and compare the result with the
+ * SLICE_PARAMS / PRED_WEIGHTS the client (FFmpeg, GStreamer) sent.  Those are
+ * the reference values, so a mismatch is a bug in the parser, and a long
+ * stream with B-frames, multiple references and reordering is the test.
+ */
+static int deinterlace;
+module_param(deinterlace, int, 0644);
+MODULE_PARM_DESC(deinterlace,
+		 "Default of the Deinterlace control for new streams: 0 off (default, woven frames), 1 VPSS motion-adaptive (frame rate)");
+
+static const char * const histb_vdec_deint_menu[] = {
+	"Off", "Motion adaptive (VPSS, frame rate)", NULL,
+};
+
+static bool h264_frame_default;
+module_param(h264_frame_default, bool, 0644);
+MODULE_PARM_DESC(h264_frame_default,
+		 "H.264: default DECODE_MODE=FRAME_BASED and START_CODE=ANNEX_B (test: makes FFmpeg use the frame-based path)");
+
+static bool h264_selfcheck;
+module_param(h264_selfcheck, bool, 0644);
+MODULE_PARM_DESC(h264_selfcheck,
+		 "H.264: compare the driver's own slice-header parse with the client's SLICE_PARAMS (debug)");
+
+static unsigned long h264_selfcheck_total, h264_selfcheck_bad;
+#define total h264_selfcheck_total
+#define bad h264_selfcheck_bad
+
+static void histb_vdec_h264_selfcheck(struct histb_vdec_ctx *ctx,
+		struct vb2_v4l2_buffer *src, unsigned long payload,
+		const struct v4l2_ctrl_h264_decode_params *decode,
+		const struct v4l2_ctrl_h264_sps *sps,
+		const struct v4l2_ctrl_h264_pps *pps,
+		const struct v4l2_ctrl_h264_slice_params *slice,
+		const struct v4l2_ctrl_h264_pred_weights *pw)
+{
+	struct histb_h264_hdr *h = kzalloc(sizeof(*h), GFP_KERNEL);
+	u8 *buf = kmalloc(HISTB_H264_MAX_HDR_BYTES, GFP_KERNEL);
+	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
+	const struct v4l2_ctrl_h264_slice_params *m;
+	const char *what = NULL;
+	size_t n, rn;
+	unsigned int i, nr0, nr1;
+	int ret;
+
+	if (!h || !buf || !data || !slice || !decode || !sps || !pps)
+		goto out;
+	data += src->vb2_buf.planes[0].data_offset;
+	n = min_t(size_t, payload, HISTB_H264_MAX_HDR_BYTES);
+	memcpy(buf, data, n);
+	rn = histb_vdec_ebsp_to_rbsp(buf, n);
+	ret = histb_h264_parse_slice_header(buf, rn, sps, pps, decode, h);
+	total++;
+	if (ret) {
+		what = "parse failed";
+		goto report;
+	}
+	m = &h->slice;
+	histb_h264_build_ref_lists(h, decode, sps);
+	nr0 = slice->num_ref_idx_l0_active_minus1 + 1;
+	nr1 = slice->num_ref_idx_l1_active_minus1 + 1;
+#define CHK(f) do { if (!what && m->f != slice->f) what = #f; } while (0)
+	CHK(first_mb_in_slice); CHK(slice_type); CHK(cabac_init_idc);
+	CHK(slice_qp_delta); CHK(disable_deblocking_filter_idc);
+	CHK(num_ref_idx_l0_active_minus1);
+	if (slice->slice_type == V4L2_H264_SLICE_TYPE_B)
+		CHK(num_ref_idx_l1_active_minus1);
+	if (!what && m->flags != slice->flags)
+		what = "flags";
+	if (!what && slice->disable_deblocking_filter_idc != 1 &&
+	    (m->slice_alpha_c0_offset_div2 != slice->slice_alpha_c0_offset_div2 ||
+	     m->slice_beta_offset_div2 != slice->slice_beta_offset_div2))
+		what = "deblock offsets";
+	if (!what && m->header_bit_size != slice->header_bit_size)
+		what = "header_bit_size";
+	if (!what && slice->slice_type != V4L2_H264_SLICE_TYPE_I) {
+		for (i = 0; i < nr0 && !what; i++)
+			if (m->ref_pic_list0[i].index != slice->ref_pic_list0[i].index ||
+			    m->ref_pic_list0[i].fields != slice->ref_pic_list0[i].fields)
+				what = "ref_pic_list0";
+		if (slice->slice_type == V4L2_H264_SLICE_TYPE_B)
+			for (i = 0; i < nr1 && !what; i++)
+				if (m->ref_pic_list1[i].index != slice->ref_pic_list1[i].index ||
+				    m->ref_pic_list1[i].fields != slice->ref_pic_list1[i].fields)
+					what = "ref_pic_list1";
+	}
+	if (!what && h->has_pw && pw &&
+	    memcmp(&h->pw.weight_factors[0].luma_weight, &pw->weight_factors[0].luma_weight,
+		   nr0 * sizeof(s16)))
+		what = "pred weights";
+#undef CHK
+report:
+	if (what) {
+		bad++;
+		dev_warn_ratelimited(ctx->vdec->dev,
+			"h264 selfcheck: %s differs (type %u first_mb %u hdr %u/%u nref %u/%u l0[0] %u:%u/%u:%u)\n",
+			what, slice->slice_type, slice->first_mb_in_slice,
+			h->slice.header_bit_size, slice->header_bit_size,
+			h->slice.num_ref_idx_l0_active_minus1 + 1, nr0,
+			h->slice.ref_pic_list0[0].index, h->slice.ref_pic_list0[0].fields,
+			slice->ref_pic_list0[0].index, slice->ref_pic_list0[0].fields);
+	}
+	if (!(total % 500))
+		dev_info(ctx->vdec->dev, "h264 selfcheck: %lu slices, %lu mismatches\n",
+			 total, bad);
+out:
+	kfree(buf);
+	kfree(h);
+}
+#undef total
+#undef bad
 
 static void histb_vdec_device_run(void *priv)
 {
@@ -12995,10 +11900,8 @@ static void histb_vdec_device_run(void *priv)
 	struct vb2_v4l2_buffer *src, *dst;
 	struct media_request *request;
 	struct histb_vdec_hevc_stream *hevc_streams = NULL;
-	struct histb_vdec_avs_stream *avs_streams = NULL;
+	struct v4l2_ctrl_hevc_slice_params *hevc_slices_norm = NULL;
 	struct histb_vdec_mpeg2_slice *mpeg2_slices = NULL;
-	struct histb_mvc_slice_identity h264_identity = {};
-	u32 h264_offset = 0;
 	dma_addr_t src_dma;
 	unsigned long payload, flags, bytesused;
 	bool mpeg4_state_failed = false;
@@ -13008,7 +11911,19 @@ static void histb_vdec_device_run(void *priv)
 	int ret;
 
 	if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_HEVC_SLICE) {
-		wait_for_completion(&vdec->postprocess_idle);
+		/*
+		 * device_run() is called synchronously from QBUF/STREAMON/
+		 * request-queue, i.e. with vfd->lock (or the media request
+		 * mutex) held: never wait for the post-processor unbounded.
+		 */
+		if (!wait_for_completion_timeout(&vdec->postprocess_idle,
+				msecs_to_jiffies(HISTB_VDEC_IDLE_WAIT_MS))) {
+			dev_err(vdec->dev,
+				"post-processor did not go idle within %u ms\n",
+				HISTB_VDEC_IDLE_WAIT_MS);
+			histb_vdec_finish_job_no_pm(ctx, VB2_BUF_STATE_ERROR);
+			return;
+		}
 		/* The completion is signalled by the worker after finish_job, but
 		 * the callback has not returned yet.  Non-pipelined codecs must not
 		 * reuse the postprocess owner during that final interval. */
@@ -13016,14 +11931,6 @@ static void histb_vdec_device_run(void *priv)
 		complete(&vdec->postprocess_idle);
 	}
 	vdec->perf_job_start_ns = ktime_get_ns();
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1) {
-		histb_vdec_run_mpeg1(ctx);
-		return;
-	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) {
-		histb_vdec_run_avs2(ctx);
-		return;
-	}
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
@@ -13056,14 +11963,48 @@ static void histb_vdec_device_run(void *priv)
 		goto finish_request;
 	}
 	payload = bytesused - src->vb2_buf.planes[0].data_offset;
-	ctx->avs = false;
-	ctx->avs_slices = 0;
-	ctx->avs_total_mbs = 0;
-	ctx->avs_basic_cfg1 = 0;
-	ctx->avs_profile = 0;
 	ctx->vp9 = false;
 	ctx->mpeg4 = false;
 	ctx->vc1 = false;
+	/*
+	 * Isolating stale VDH/FSP state between HEVC pictures.
+	 *
+	 * This used to pulse the CRG MFD reset and wait for its acknowledge on
+	 * every picture, and the acknowledge never arrives: the ACK register
+	 * reports the VDH, SCD and BPD resets as done (bits 0/1/3) while the
+	 * MFD bit (2) stays clear, so each frame burned the full 30 ms poll
+	 * budget and aborted with -ETIMEDOUT.  HEVC then decoded at 0.592x
+	 * with 1401 timeouts over three runs, while h264/mpeg2/vp8/vp9 on the
+	 * same path never reset and were clean at 3.55-3.83x.
+	 *
+	 * The vendor pulses the same bit with the same 30 ms budget, but only
+	 * when a channel is torn down or opened, never per picture, and it
+	 * guards the pulse with the VDH clock enable.  Per picture the vendor
+	 * instead uses the selective reset that this driver already writes as
+	 * SCD_VDH_SELRST - so the per-picture MFD reset here was redundant as
+	 * well as failing.
+	 *
+	 * Kept behind a parameter rather than deleted, because no git history
+	 * survives that would say what it was added for: if disabling it
+	 * regresses a stream, that is the evidence needed to investigate
+	 * properly, and the diagnostics below report the clock state.
+	 */
+	/*
+	 * There used to be a CRG MFD reset pulse here, once per HEVC picture,
+	 * waiting on an acknowledge bit that never asserts: the ACK register
+	 * reports the VDH, SCD and BPD resets done while the MFD bit stays
+	 * clear, so every frame burned the full 30 ms poll budget and aborted
+	 * with -ETIMEDOUT.  HEVC decoded at 0.592x with 1401 timeouts over
+	 * three runs while h264/mpeg2/vp8/vp9, which never reset, were clean
+	 * at 3.55-3.83x.
+	 *
+	 * The vendor pulses the same bit with the same budget only at channel
+	 * teardown and open, guarded by the VDH clock enable; per picture it
+	 * uses the selective reset this driver already writes as
+	 * SCD_VDH_SELRST.  Removing the pulse took HEVC to 3.47x with zero
+	 * timeouts and a decoded frame hash identical to the previous
+	 * behaviour.
+	 */
 	if (histb_vdec_is_vc1_format(ctx->src.pix.pixelformat)) {
 		histb_vdec_complete_request(ctx, request);
 		histb_vdec_run_vc1_job(ctx, decoded, src, payload);
@@ -13114,97 +12055,6 @@ static void histb_vdec_device_run(void *priv)
 		mutex_unlock(&ctx->mpeg4_lock);
 		goto start_hardware;
 	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE) {
-		struct v4l2_ctrl *avs_slice_ctrl;
-		const struct v4l2_ctrl_avs_sequence *avs_sequence;
-		const struct v4l2_ctrl_avs_picture *avs_picture;
-		const struct v4l2_ctrl_avs_slice_params *avs_slices;
-		const struct v4l2_ctrl_avs_decode_params *avs_decode;
-		const u8 *payload_data;
-		unsigned int num_slices;
-
-		avs_sequence = histb_vdec_ctrl_data(ctx,
-						    V4L2_CID_STATELESS_AVS_SEQUENCE);
-		avs_picture = histb_vdec_ctrl_data(ctx,
-						   V4L2_CID_STATELESS_AVS_PICTURE);
-		avs_slice_ctrl = v4l2_ctrl_find(&ctx->ctrl_handler,
-						V4L2_CID_STATELESS_AVS_SLICE_PARAMS);
-		avs_slices = avs_slice_ctrl ? avs_slice_ctrl->p_cur.p : NULL;
-		num_slices = avs_slice_ctrl ? avs_slice_ctrl->elems : 0;
-		avs_decode = histb_vdec_ctrl_data(ctx,
-						  V4L2_CID_STATELESS_AVS_DECODE_PARAMS);
-		payload_data = vb2_plane_vaddr(&src->vb2_buf, 0);
-		if (payload_data)
-			payload_data += src->vb2_buf.planes[0].data_offset;
-		ret = histb_vdec_validate_avs(ctx, avs_sequence, avs_picture,
-					      avs_slices, num_slices, avs_decode,
-					      payload_data, payload);
-		if (ret)
-			goto finish_request;
-		ret = histb_vdec_set_decoded_buffer_sizes(ctx, decoded);
-		if (ret)
-			goto finish_request;
-		if (!histb_vdec_dma_buffers_valid(ctx)) {
-			ret = -EINVAL;
-			goto finish_request;
-		}
-		if (!histb_vdec_smmu_dma_buffers_valid(ctx)) {
-			ret = -ERANGE;
-			goto finish_request;
-		}
-		avs_streams = kcalloc(num_slices, sizeof(*avs_streams), GFP_KERNEL);
-		if (!avs_streams) {
-			ret = -ENOMEM;
-			goto finish_request;
-		}
-		ret = histb_vdec_copy_avs_bitstream(ctx, src, payload, avs_slices,
-						    num_slices, &src_dma, avs_streams);
-		if (ret)
-			goto finish_request;
-		ret = histb_vdec_prepare_avs_messages(ctx, decoded, avs_sequence,
-						      avs_picture, avs_decode, avs_slices,
-						      num_slices, src_dma, avs_streams);
-		if (ret)
-			goto finish_request;
-
-		total_mbs = DIV_ROUND_UP(avs_sequence->horizontal_size, 16) *
-			histb_vdec_avs_height_mbs(avs_sequence->vertical_size,
-						  avs_sequence->flags &
-						  V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE);
-		ctx->total_mbs = total_mbs;
-		ctx->avs_total_mbs = total_mbs;
-		ctx->avs_slices = num_slices;
-		ctx->avs_profile = avs_sequence->profile_id;
-		ctx->avs_basic_cfg1 = HISTB_VDEC_BASIC_CFG1_AVS;
-		if (avs_picture->picture_coding_type != V4L2_AVS_PICTURE_TYPE_B)
-			ctx->avs_basic_cfg1 |= HISTB_VDEC_BASIC_CFG1_AVS_MV_OUT;
-		switch (avs_picture->picture_coding_type) {
-		case V4L2_AVS_PICTURE_TYPE_P:
-			ctx->frame_flags = V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
-			break;
-		case V4L2_AVS_PICTURE_TYPE_B:
-			ctx->frame_flags = V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
-			break;
-		default:
-			ctx->frame_flags = 0;
-			break;
-		}
-		ctx->avs = true;
-		ctx->hevc = false;
-		ctx->hevc_main10 = false;
-		ctx->hevc_scaling_list = false;
-		ctx->hevc_slices = 0;
-		ctx->mpeg2 = false;
-		ctx->mpeg2_slices = 0;
-		ctx->vp8 = false;
-		ctx->vp9 = false;
-		ctx->cabac = false;
-		ctx->mbaff = false;
-		histb_vdec_complete_request(ctx, request);
-		kfree(avs_streams);
-		avs_streams = NULL;
-		goto start_hardware;
-	}
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE) {
 		struct v4l2_ctrl *hevc_entry_ctrl, *hevc_slice_ctrl;
 		const struct v4l2_ctrl_hevc_decode_params *hevc_decode;
@@ -13235,6 +12085,26 @@ static void histb_vdec_device_run(void *priv)
 			ret = -EINVAL;
 			goto finish_request;
 		}
+		if (num_slices > HISTB_VDEC_HEVC_MAX_SLICES) {
+			ret = -EINVAL;
+			goto finish_request;
+		}
+		hevc_slices_norm = kmalloc_array(num_slices,
+						 sizeof(*hevc_slices_norm),
+						 GFP_KERNEL);
+		if (!hevc_slices_norm) {
+			ret = -ENOMEM;
+			goto finish_request;
+		}
+		ret = histb_vdec_hevc_normalize_slices(hevc_slice, num_slices,
+						       payload, hevc_slices_norm);
+		if (ret) {
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC slice sizes do not add up to the %lu byte payload (%u slices)\n",
+					    payload, num_slices);
+			goto finish_request;
+		}
+		hevc_slice = hevc_slices_norm;
 		ret = histb_vdec_validate_hevc_frame(ctx, hevc_decode, hevc_sps,
 						     hevc_pps, hevc_slice, num_slices,
 					      hevc_entry_ctrl ?
@@ -13249,8 +12119,6 @@ static void histb_vdec_device_run(void *priv)
 		}
 		ctx->hevc = true;
 		ctx->hevc_main10 = hevc_sps->bit_depth_luma_minus8 == 2;
-		ctx->hevc_ctb_log2 = hevc_sps->log2_min_luma_coding_block_size_minus3 +
-			3 + hevc_sps->log2_diff_max_min_luma_coding_block_size;
 		ctx->hevc_scaling_list = hevc_sps->flags &
 			V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED;
 		ctx->hevc_slices = num_slices;
@@ -13284,8 +12152,8 @@ static void histb_vdec_device_run(void *priv)
 			goto finish_request;
 		}
 		ret = histb_vdec_prepare_hevc_messages(ctx, decoded,
-			hevc_decode, hevc_sps, hevc_pps, hevc_slice, num_slices,
-			hevc_scaling, src_dma, hevc_streams);
+						       hevc_decode, hevc_sps, hevc_pps, hevc_slice,
+				num_slices, hevc_scaling, src_dma, hevc_streams);
 		if (ret) {
 			dev_err_ratelimited(vdec->dev,
 					    "HEVC message preparation failed: %d\n",
@@ -13294,6 +12162,8 @@ static void histb_vdec_device_run(void *priv)
 		}
 		kfree(hevc_streams);
 		hevc_streams = NULL;
+		kfree(hevc_slices_norm);
+		hevc_slices_norm = NULL;
 		total_mbs = DIV_ROUND_UP(hevc_sps->pic_width_in_luma_samples,
 					 BIT(hevc_sps->log2_min_luma_coding_block_size_minus3 + 3 +
 			    hevc_sps->log2_diff_max_min_luma_coding_block_size)) *
@@ -13479,86 +12349,28 @@ static void histb_vdec_device_run(void *priv)
 				     V4L2_CID_STATELESS_H264_SLICE_PARAMS);
 	pred_weights = histb_vdec_ctrl_data(
 		ctx, V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
-	ret = histb_vdec_h264_packet(ctx, src, &payload, &h264_offset, &h264_identity);
-	if (ret)
-		goto finish_request;
-	ctx->h264_new_frame =
-		!ctx->h264_partial && slice && !slice->first_mb_in_slice;
-	ctx->h264_last_slice =
-		!(src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF);
-	ctx->h264_first_mb = slice ? slice->first_mb_in_slice : 0;
-	ret = histb_vdec_validate_h264(ctx, decode, sps, pps, slice,
-				      pred_weights, payload, ctx->h264_new_frame);
-	if (ret)
-		goto finish_request;
-	if (ctx->h264_slices >= HISTB_VDEC_H264_MAX_SLICES) {
-		ret = -E2BIG;
-		goto finish_request;
-	}
-	if (ctx->h264_new_frame) {
-		if (ctx->mvc_ingress.subset.is_valid) {
-			mutex_lock(&ctx->mvc_lock);
-			ret = histb_mvc_ingress_prepare(&ctx->mvc_ingress,
-						      &h264_identity, decode, decoded);
-			mutex_unlock(&ctx->mvc_lock);
-			if (ret)
-				goto finish_request;
-			histb_vdec_mvc_reap(ctx);
-			/* Request timestamps identify the user's exact CAPTURE target. */
-			if (histb_vdec_mvc_busy(ctx, decoded)) {
-				ret = -EBUSY;
-				goto finish_request;
-			}
-		}
-		ret = histb_vdec_begin_h264_picture(
-			ctx, decoded, src->vb2_buf.timestamp, decode, sps);
+	if (histb_vdec_h264_frame_based(ctx)) {
+		ret = histb_vdec_h264_run_frame(ctx, decoded, src, payload,
+						decode, sps, pps, scaling,
+						&total_mbs);
 		if (ret)
 			goto finish_request;
+		histb_vdec_complete_request(ctx, request);
+		ctx->h264_new_frame = true;
+		src_dma = ctx->bitstream.dma;
+		goto start_hardware;
 	}
-
-	if (!histb_vdec_dma_buffers_valid(ctx)) {
-		ret = -EINVAL;
-		goto finish_request;
-	}
-	{
-		u32 tail_bits;
-
-		ret = histb_vdec_append_h264_bitstream(ctx, src, h264_offset,
-						       &payload, &src_dma, &tail_bits);
-		if (ret)
-			goto finish_request;
-		/* CABAC retains rbsp_stop_one_bit and removes trailing zero bits. */
-		if (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
-			tail_bits--;
-		ret = histb_vdec_prepare_messages(ctx, decoded, decode, sps, pps,
-					  scaling, slice, pred_weights,
-					  ctx->bitstream.dma, src_dma,
-					  payload, tail_bits, ctx->h264_slices,
-					  ctx->h264_new_frame,
-					  ctx->h264_new_surface,
-					  &h264_identity, src->vb2_buf.timestamp);
-	}
+	if (READ_ONCE(h264_selfcheck))
+		histb_vdec_h264_selfcheck(ctx, src, payload, decode, sps, pps,
+					  slice, pred_weights);
+	ret = histb_vdec_h264_stage_slice(ctx, decoded, src, 0, payload,
+					  decode, sps, pps, scaling, slice,
+					  pred_weights,
+					  !(src->flags &
+					    V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF),
+					  &total_mbs);
 	if (ret)
 		goto finish_request;
-	total_mbs = (sps->pic_width_in_mbs_minus1 + 1) *
-		    (sps->pic_height_in_map_units_minus1 + 1);
-	if (!(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
-	    !(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
-		total_mbs *= 2;
-	ctx->total_mbs = total_mbs;
-	ctx->frame_flags = decode->flags;
-	ctx->hevc = false;
-	ctx->hevc_main10 = false;
-	ctx->hevc_scaling_list = false;
-	ctx->hevc_slices = 0;
-	ctx->mpeg2 = false;
-	ctx->mpeg2_slices = 0;
-	ctx->vp8 = false;
-	ctx->cabac = pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
-	ctx->mbaff =
-		!(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
-		(sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD);
-	ctx->h264_slices++;
 
 	histb_vdec_complete_request(ctx, request);
 	if (!ctx->h264_last_slice) {
@@ -13589,33 +12401,6 @@ start_hardware:
 			histb_vdec_fail_mpeg4_state(ctx);
 		histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
 		return;
-	}
-	if (ctx->avs && (vdec->backend->caps & HISTB_VDEC_BACKEND_AVSP) &&
-	    vdec->smmu.identity_needs_reset) {
-		/*
-		 * Initialize a new VDH page-table context before GlbResetX. The
-		 * normal AVS launch installs the same table again after the reset.
-		 */
-		mutex_lock(&vdec->launch_lock);
-		histb_vdec_program_smmu(vdec, true);
-		ret = histb_vdec_reset_vdh_domain(vdec);
-		if (!ret)
-			vdec->smmu.identity_needs_reset = false;
-		mutex_unlock(&vdec->launch_lock);
-		if (ret) {
-			dev_err(vdec->dev,
-				"failed to initialize AVS SMMU domain: %d\n", ret);
-			histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
-			return;
-		}
-	}
-	if (ctx->avs && (vdec->backend->caps & HISTB_VDEC_BACKEND_AVSP)) {
-		ret = histb_vdec_load_avsp(vdec);
-		if (ret) {
-			dev_err(vdec->dev, "failed to load AVSP firmware: %d\n", ret);
-			histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
-			return;
-		}
 	}
 
 	/*
@@ -13664,10 +12449,7 @@ start_hardware:
 	}
 	schedule_delayed_work(&vdec->watchdog_work,
 			      msecs_to_jiffies(HISTB_VDEC_WATCHDOG_MS));
-	if (ctx->avs) {
-		histb_vdec_program_avs_registers(ctx, decoded, src_dma,
-						 total_mbs);
-	} else if (ctx->vp8) {
+	if (ctx->vp8) {
 		if (!ctx->vp8_pending_frame_type)
 			memset(ctx->buffers[HISTB_VDEC_BUF_VP8_SEG].cpu, 0,
 			       ctx->buffers[HISTB_VDEC_BUF_VP8_SEG].size);
@@ -13696,15 +12478,9 @@ start_hardware:
 finish_request:
 	dev_err(vdec->dev, "%4.4s request setup failed: %d\n",
 			    (char *)&ctx->src.pix.pixelformat, ret);
-	kfree(avs_streams);
 	kfree(hevc_streams);
+	kfree(hevc_slices_norm);
 	kfree(mpeg2_slices);
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE) {
-		decoded->avs.valid = false;
-		ctx->avs = false;
-		ctx->avs_slices = 0;
-		ctx->avs_total_mbs = 0;
-	}
 	if (vp9_staged)
 		histb_vdec_discard_vp9_state(ctx);
 	if (!mpeg4_state_failed &&
@@ -13721,7 +12497,6 @@ static void histb_vdec_job_abort(void *priv)
 
 static const struct v4l2_m2m_ops histb_vdec_m2m_ops = {
 	.device_run = histb_vdec_device_run,
-	.job_ready = histb_vdec_job_ready,
 	.job_abort = histb_vdec_job_abort,
 };
 
@@ -13748,8 +12523,6 @@ static void histb_vdec_free_buffers(struct histb_vdec_ctx *ctx)
 {
 	unsigned int i;
 
-	histb_vdec_avs2_free(ctx);
-	histb_vdec_mpeg1_free(ctx);
 	histb_vdec_reset_mpeg4_state(ctx);
 	histb_vdec_reset_vc1_state(ctx);
 	if (ctx->bitstream.cpu) {
@@ -13757,6 +12530,13 @@ static void histb_vdec_free_buffers(struct histb_vdec_ctx *ctx)
 				  ctx->bitstream.cpu, ctx->bitstream.dma);
 		memset(&ctx->bitstream, 0, sizeof(ctx->bitstream));
 	}
+	for (i = 0; i < ARRAY_SIZE(ctx->deint_w); i++) {
+		if (ctx->deint_w[i].cpu)
+			dma_free_coherent(ctx->vdec->dev, ctx->deint_w[i].size,
+					  ctx->deint_w[i].cpu, ctx->deint_w[i].dma);
+		memset(&ctx->deint_w[i], 0, sizeof(ctx->deint_w[i]));
+	}
+	ctx->deint_prev_valid = false;
 	kvfree(ctx->hevc_stream_shadow);
 	ctx->hevc_stream_shadow = NULL;
 	ctx->hevc_stream_shadow_size = 0;
@@ -13772,23 +12552,13 @@ static void histb_vdec_free_buffers(struct histb_vdec_ctx *ctx)
 	for (i = 0; i < HISTB_VDEC_BUF_COUNT; i++) {
 		struct histb_vdec_dma_buffer *buffer = &ctx->buffers[i];
 
-		if (buffer->cpu && !ctx->buf_arena.cpu)
+		if (buffer->cpu)
 			dma_free_coherent(ctx->vdec->dev, buffer->size,
 					  buffer->cpu, buffer->dma);
 		memset(buffer, 0, sizeof(*buffer));
 	}
-	if (ctx->buf_arena.cpu) {
-		dma_free_coherent(ctx->vdec->dev, ctx->buf_arena.size,
-				  ctx->buf_arena.cpu, ctx->buf_arena.dma);
-		memset(&ctx->buf_arena, 0, sizeof(ctx->buf_arena));
-	}
 	ctx->h264_cabac_loaded = false;
 	ctx->hevc_cabac_loaded = false;
-	ctx->avs = false;
-	ctx->avs_slices = 0;
-	ctx->avs_total_mbs = 0;
-	ctx->avs_basic_cfg1 = 0;
-	ctx->avs_profile = 0;
 	histb_vdec_reset_vp8_state(ctx);
 	histb_vdec_reset_vp9_state(ctx);
 }
@@ -13800,9 +12570,6 @@ static size_t histb_vdec_buffer_size(struct histb_vdec_ctx *ctx,
 	     id == HISTB_VDEC_BUF_VC1_INTENSITY) &&
 	    !histb_vdec_is_vc1_format(ctx->src.pix.pixelformat))
 		return 0;
-	if (id == HISTB_VDEC_BUF_AVS_DNR_MBINFO &&
-	    ctx->src.pix.pixelformat != V4L2_PIX_FMT_AVS_SLICE)
-		return 0;
 	if ((id == HISTB_VDEC_BUF_MPEG4_DNR_MBINFO ||
 	     id == HISTB_VDEC_BUF_MPEG4_ITRANS ||
 	     id == HISTB_VDEC_BUF_MPEG4_PMV_TOP ||
@@ -13812,9 +12579,6 @@ static size_t histb_vdec_buffer_size(struct histb_vdec_ctx *ctx,
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE &&
 	    id == HISTB_VDEC_BUF_MSG)
 		return HISTB_VDEC_MPEG2_MSG_SIZE;
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
-	    id == HISTB_VDEC_BUF_MSG)
-		return HISTB_VDEC_AVS_MSG_SIZE;
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 &&
 	    id == HISTB_VDEC_BUF_MSG)
 		return HISTB_VDEC_MPEG4_MSG_SIZE;
@@ -13878,169 +12642,13 @@ release_firmware:
 	return ret;
 }
 
-static void histb_vdec_release_avsp(void *data)
-{
-	struct histb_vdec_dev *vdec = data;
-	struct histb_vdec_dma_buffer *buffer = &vdec->avsp_firmware;
-
-	if (buffer->cpu)
-		dma_free_coherent(vdec->dev, buffer->size, buffer->cpu,
-				  buffer->dma);
-	memset(buffer, 0, sizeof(*buffer));
-	vdec->avsp_available = false;
-	vdec->avsp_loaded = false;
-}
-
-static int histb_vdec_prepare_avsp(struct histb_vdec_dev *vdec)
-{
-	struct histb_vdec_dma_buffer *buffer = &vdec->avsp_firmware;
-	const struct firmware *firmware;
-	int ret;
-
-	if (vdec->avsp_available)
-		return 0;
-
-	ret = request_firmware_direct(&firmware, HISTB_VDEC_AVSP_FIRMWARE,
-				      vdec->dev);
-	if (ret) {
-		dev_err(vdec->dev, "failed to load %s: %d\n",
-			HISTB_VDEC_AVSP_FIRMWARE, ret);
-		return ret;
-	}
-	if (firmware->size != HISTB_VDEC_AVSP_FIRMWARE_SIZE) {
-		dev_err(vdec->dev, "%s has invalid size %zu (expected %u)\n",
-			HISTB_VDEC_AVSP_FIRMWARE, firmware->size,
-			HISTB_VDEC_AVSP_FIRMWARE_SIZE);
-		ret = -EINVAL;
-		goto release_firmware;
-	}
-
-	buffer->size = HISTB_VDEC_AVSP_FIRMWARE_SIZE;
-	buffer->cpu = dma_alloc_coherent(vdec->dev, buffer->size,
-					 &buffer->dma, GFP_KERNEL);
-	if (!buffer->cpu) {
-		ret = -ENOMEM;
-		goto release_firmware;
-	}
-	if (!histb_vdec_smmu_dma_buffer_valid(buffer) ||
-	    !IS_ALIGNED(buffer->dma, HISTB_VDEC_AVSP_FIRMWARE_ALIGN)) {
-		dev_err(vdec->dev, "AVSP DMA address %pad is not usable\n",
-			&buffer->dma);
-		dma_free_coherent(vdec->dev, buffer->size, buffer->cpu,
-				  buffer->dma);
-		memset(buffer, 0, sizeof(*buffer));
-		ret = -ERANGE;
-		goto release_firmware;
-	}
-
-	memcpy(buffer->cpu, firmware->data, firmware->size);
-	vdec->avsp_available = true;
-	vdec->avsp_loaded = false;
-	ret = 0;
-
-release_firmware:
-	release_firmware(firmware);
-	return ret;
-}
-
-static int histb_vdec_load_avsp(struct histb_vdec_dev *vdec)
-{
-	u32 state;
-	int ret;
-
-	if (vdec->avsp_loaded)
-		return 0;
-	if (!vdec->avsp_available)
-		return -ENOENT;
-
-	writel(HISTB_VDEC_SCD_EMAR_BASE | HISTB_VDEC_SCD_EMAR_ENABLE,
-	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
-	writel(1, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
-	writel(HISTB_VDEC_AVSP_FIRMWARE_SIZE / sizeof(u32),
-	       vdec->regs + HISTB_VDEC_SCD_DSP_CODE_WORDS);
-	writel(lower_32_bits(vdec->avsp_firmware.dma),
-	       vdec->regs + HISTB_VDEC_SCD_DSP_CODE_ADDR);
-	/* Make the copied firmware and its descriptor visible before DSP start. */
-	wmb();
-	writel(0, vdec->regs + HISTB_VDEC_SCD_DSP_CTRL);
-	writel(5, vdec->regs + HISTB_VDEC_SCD_DSP_CTRL);
-	usleep_range(30, 60);
-	ret = readl_poll_timeout(vdec->regs + HISTB_VDEC_SCD_DSP_STATE,
-				 state, state & BIT(0), 30,
-				 HISTB_CRG_RESET_TIMEOUT_US);
-	if (ret) {
-		dev_err(vdec->dev,
-			"AVSP firmware did not become ready: %d state=%08x\n",
-			ret, state);
-		return ret;
-	}
-
-	vdec->avsp_loaded = true;
-	return 0;
-}
-
 static int histb_vdec_alloc_buffers(struct histb_vdec_ctx *ctx)
 {
 	struct device *dev = ctx->vdec->dev;
 	unsigned int i;
 	int ret = -ENOMEM;
 
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1)
-		return histb_vdec_mpeg1_alloc(ctx);
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2)
-		return histb_vdec_avs2_alloc(ctx);
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
-	    (ctx->vdec->backend->caps & HISTB_VDEC_BACKEND_AVSP)) {
-		ret = histb_media_smmu_prepare_identity(&ctx->vdec->smmu,
-							ctx->vdec->dev);
-		if (ret)
-			return ret;
-	}
-
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
-	    (ctx->vdec->backend->caps & HISTB_VDEC_BACKEND_AVSP)) {
-		dma_addr_t base_dma, next;
-		void *base_cpu;
-		size_t total = 0;
-
-		/* Group work buffers into one allocation and validate the whole
-		 * range against the AVS identity aperture before carving it up. */
-		for (i = 0; i < HISTB_VDEC_BUF_COUNT; i++)
-			total += histb_vdec_buffer_size(ctx, i) + SZ_4K;
-		total = max_t(size_t, total, SZ_4M);
-
-		ctx->buf_arena.size = total;
-		ctx->buf_arena.cpu = dma_alloc_coherent(dev, total,
-						       &ctx->buf_arena.dma,
-						       GFP_KERNEL);
-		if (!ctx->buf_arena.cpu)
-			goto free_buffers;
-		memset(ctx->buf_arena.cpu, 0, total);
-
-		if (!histb_media_smmu_dma_range_valid(ctx->buf_arena.dma,
-						      total)) {
-			dev_err(dev,
-				"AVS buffer arena 0x%llx+%zu is outside the SMMU identity window\n",
-				(unsigned long long)ctx->buf_arena.dma, total);
-			goto free_buffers;
-		}
-
-		base_dma = ctx->buf_arena.dma;
-		base_cpu = ctx->buf_arena.cpu;
-		next = base_dma;
-		for (i = 0; i < HISTB_VDEC_BUF_COUNT; i++) {
-			size_t size = histb_vdec_buffer_size(ctx, i);
-
-			if (!size)
-				continue;
-			next = ALIGN(next, SZ_4K);
-			ctx->buffers[i].size = size;
-			ctx->buffers[i].dma = next;
-			ctx->buffers[i].cpu =
-				(u8 *)base_cpu + (next - base_dma);
-			next += size;
-		}
-	} else if (!ctx->buffers[HISTB_VDEC_BUF_MSG].cpu) {
+	if (!ctx->buffers[HISTB_VDEC_BUF_MSG].cpu) {
 		for (i = 0; i < HISTB_VDEC_BUF_COUNT; i++) {
 			struct histb_vdec_dma_buffer *buffer = &ctx->buffers[i];
 			size_t size = histb_vdec_buffer_size(ctx, i);
@@ -14056,10 +12664,7 @@ static int histb_vdec_alloc_buffers(struct histb_vdec_ctx *ctx)
 		}
 	}
 
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
-	    (ctx->vdec->backend->caps & HISTB_VDEC_BACKEND_AVSP))
-		ret = histb_vdec_prepare_avsp(ctx->vdec);
-	else if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE)
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE)
 		ret = histb_vdec_load_cabac(ctx, HISTB_VDEC_BUF_HEVC_CABAC,
 					    HISTB_VDEC_HEVC_CABAC_FIRMWARE,
 					    HISTB_VDEC_HEVC_CABAC_SIZE,
@@ -14089,6 +12694,62 @@ static int histb_vdec_queue_setup(struct vb2_queue *vq,
 	struct histb_vdec_q_data *q_data =
 		histb_vdec_get_q_data(ctx, vq->type);
 
+	/*
+	 * A 3840x2160 capture buffer is 12.4 MB and the whole CMA area is
+	 * 192 MiB, so the number of them decides whether the queue can be
+	 * filled at all.  Measured: H.264 4K asks for 11 and decodes, VP9 4K
+	 * asks for 17 - 211 MB - and every frame fails with
+	 * "cma: __cma_alloc: alloc failed".  It is a capacity limit, not
+	 * fragmentation: the earlier reading of "3531 pages free, 3038
+	 * requested" was a snapshot taken after the first few buffers had
+	 * already been taken.  Cap the count for the large geometries so the
+	 * queue fits, and say so, because silently reducing a user's request
+	 * is exactly the kind of thing that hides a problem.
+	 */
+	if (!V4L2_TYPE_IS_OUTPUT(vq->type)) {
+		unsigned int max_large_buffers =
+			HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS;
+
+		/*
+		 * The count arrives one buffer at a time through CREATE_BUFS,
+		 * so capping *nbuffers does not bound it - the queue's own
+		 * limit does.  Seen from the board: H.264 4K ends up with 11
+		 * capture buffers and decodes, VP9 4K ends up with 17 and every
+		 * frame fails with "cma: __cma_alloc: alloc failed", because 17
+		 * x 12.4 MB is 211 MB against a 192 MiB CMA area.  Capacity,
+		 * not fragmentation.  Bound it for the large geometries only.
+		 */
+		if (q_data->pix.sizeimage > SZ_8M &&
+		    vq->max_num_buffers > max_large_buffers)
+			vq->max_num_buffers = max_large_buffers;
+
+		if (q_data->pix.sizeimage > SZ_8M &&
+		    *nbuffers > max_large_buffers) {
+			dev_info_ratelimited(ctx->vdec->dev,
+					     "capture queue asks for %u buffers of %u bytes; limiting to %u to fit the 192 MiB CMA area\n",
+					     *nbuffers, q_data->pix.sizeimage,
+					     max_large_buffers);
+			*nbuffers = max_large_buffers;
+		}
+	}
+
+	/*
+	 * Chromium's V4L2 decoder asks for num_reference_frames + 2 CAPTURE buffers
+	 * (one being decoded, one for an image processor) and, without an image
+	 * processor, hands the very same buffers to the compositor, which keeps
+	 * several of them for display.  With the 6 it asked for (4 references) all
+	 * six end up held and decoding stops after six frames.  A request may be
+	 * answered with more buffers, and Chromium uses every one it gets, so the
+	 * multi-planar client gets headroom (3 MB each at 1080p; 4K, whose buffers
+	 * are 12.4 MB, only 2 more).
+	 */
+	if (ctx->mplane && !V4L2_TYPE_IS_OUTPUT(vq->type) && !*nplanes) {
+		unsigned int want = q_data->pix.sizeimage > SZ_8M ?
+			*nbuffers + 2 : max(*nbuffers + 6, 12U);
+
+		*nbuffers = min(want, vq->max_num_buffers);
+	}
+
 	if (*nplanes)
 		return *nplanes != 1 || sizes[0] < q_data->pix.sizeimage ?
 		       -EINVAL : 0;
@@ -14111,10 +12772,7 @@ static int histb_vdec_buf_prepare(struct vb2_buffer *vb)
 	    vb2_plane_size(vb, 0) - data_offset < q_data->pix.sizeimage)
 		return -EINVAL;
 	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) &&
-	    (payload < data_offset || payload > vb2_plane_size(vb, 0) ||
-	     (payload == data_offset &&
-	      ctx->src.pix.pixelformat != V4L2_PIX_FMT_AVS2 &&
-	      ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG1)))
+	    (payload <= data_offset || payload > vb2_plane_size(vb, 0)))
 		return -EINVAL;
 
 	vbuf->field = V4L2_FIELD_NONE;
@@ -14137,7 +12795,6 @@ static int histb_vdec_buf_init(struct vb2_buffer *vb)
 	decoded->apc_slot = HISTB_VDEC_APC_INVALID;
 	decoded->error_tainted = false;
 	decoded->mpeg2_field_saved = false;
-	memset(&decoded->avs, 0, sizeof(decoded->avs));
 	decoded->vp9_dpb_valid = false;
 	decoded->vp9_logic_id = HISTB_VDEC_APC_INVALID;
 	decoded->vp9_width = 0;
@@ -14170,7 +12827,6 @@ static void histb_vdec_buf_cleanup(struct vb2_buffer *vb)
 	decoded->apc_slot = HISTB_VDEC_APC_INVALID;
 	decoded->error_tainted = false;
 	decoded->mpeg2_field_saved = false;
-	memset(&decoded->avs, 0, sizeof(decoded->avs));
 	if (ctx->h264_pending_field == decoded)
 		histb_vdec_reset_h264_field_pair(ctx);
 	{
@@ -14203,10 +12859,6 @@ static void histb_vdec_buf_queue(struct vb2_buffer *vb)
 	if (!V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type)) {
 		decoded = container_of(vb, struct histb_vdec_decoded_buffer,
 				       base.vb.vb2_buf);
-		mutex_lock(&ctx->mvc_lock);
-		histb_mvc_ingress_requeue(&ctx->mvc_ingress, decoded);
-		mutex_unlock(&ctx->mvc_lock);
-		decoded->avs.valid = false;
 		/* Stateless reference formats clear this only for a new target. */
 		if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_H264_SLICE &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG2_SLICE &&
@@ -14267,22 +12919,10 @@ static int histb_vdec_start_streaming(struct vb2_queue *vq,
 	}
 	if (!ret && V4L2_TYPE_IS_OUTPUT(vq->type))
 		histb_vdec_reset_vc1_state(ctx);
-	if (!ret && V4L2_TYPE_IS_OUTPUT(vq->type) &&
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE) {
-		ctx->avs = false;
-		ctx->avs_slices = 0;
-		ctx->avs_total_mbs = 0;
-		ctx->avs_basic_cfg1 = 0;
-		ctx->avs_profile = 0;
-	}
 	if (!ret && V4L2_TYPE_IS_OUTPUT(vq->type)) {
 		v4l2_m2m_clear_state(m2m_ctx);
 		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m_ctx));
 	}
-	if (!ret && ctx->mpeg1)
-		WRITE_ONCE(ctx->mpeg1->aborted, false);
-	if (!ret && V4L2_TYPE_IS_CAPTURE(vq->type) && ctx->mpeg1)
-		ctx->mpeg1->capture_configured = true;
 	if (ret)
 		histb_vdec_return_buffers(ctx, vq->type);
 
@@ -14300,33 +12940,6 @@ static void histb_vdec_stop_streaming(struct vb2_queue *vq)
 		V4L2_TYPE_IS_CAPTURE(vq->type) &&
 		v4l2_m2m_has_stopped(m2m_ctx);
 	histb_vdec_abort(ctx);
-	if (ctx->mpeg1) {
-		mutex_lock(&ctx->mpeg1->lock);
-		if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
-			histb_mpeg1_init(&ctx->mpeg1->decoder);
-			ctx->mpeg1->au_valid = false;
-			ctx->mpeg1->output_valid = false;
-			ctx->mpeg1->drain = false;
-			ctx->mpeg1->eos = false;
-		} else {
-			/* CAPTURE streamoff during source change retains the saved AU. */
-			histb_mpeg1_clear_dpb(&ctx->mpeg1->decoder);
-			ctx->mpeg1->output_valid = false;
-		}
-		mutex_unlock(&ctx->mpeg1->lock);
-	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2 && ctx->avs2) {
-		if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
-			histb_avs2_init(&ctx->avs2->decoder);
-			ctx->avs2->au_valid = false;
-			ctx->avs2->output_valid = false;
-			ctx->avs2->drain = false;
-			ctx->avs2->eos = false;
-		} else if (!ctx->avs2->source_change) {
-			histb_avs2_clear_dpb(&ctx->avs2->decoder);
-			ctx->avs2->output_valid = false;
-		}
-	}
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE) {
 		histb_vdec_reset_h264_slices(ctx);
 		histb_vdec_reset_h264_field_pair(ctx);
@@ -14380,7 +12993,8 @@ static int histb_vdec_queue_init(void *priv, struct vb2_queue *src_vq,
 	struct histb_vdec_dev *vdec = ctx->vdec;
 	int ret;
 
-	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	src_vq->type = ctx->mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
+				     V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	src_vq->io_modes = VB2_MMAP;
 	src_vq->drv_priv = ctx;
 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
@@ -14398,7 +13012,8 @@ static int histb_vdec_queue_init(void *priv, struct vb2_queue *src_vq,
 	if (ret)
 		return ret;
 
-	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	dst_vq->type = ctx->mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+				     V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
 	dst_vq->buf_struct_size = sizeof(struct histb_vdec_decoded_buffer);
@@ -14426,15 +13041,16 @@ static int histb_vdec_querycap(struct file *file, void *priv,
 static int histb_vdec_enum_fmt(struct file *file, void *priv,
 			       struct v4l2_fmtdesc *f)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
-	const struct histb_vdec_backend *backend = ctx->vdec->backend;
-
 	if (!V4L2_TYPE_IS_OUTPUT(f->type)) {
 		switch (f->index) {
 		case 0:
 			f->pixelformat = V4L2_PIX_FMT_NV12;
 			break;
 		case 1:
+			/* 10-bit output exists for HEVC Main10 only. */
+			if (file_to_histb_vdec_ctx(file)->src.pix.pixelformat !=
+			    V4L2_PIX_FMT_HEVC_SLICE)
+				return -EINVAL;
 			f->pixelformat = V4L2_PIX_FMT_P010;
 			break;
 		default:
@@ -14442,27 +13058,74 @@ static int histb_vdec_enum_fmt(struct file *file, void *priv,
 		}
 		return 0;
 	}
-	if (f->index >= backend->num_formats)
+
+	switch (f->index) {
+	case 0:
+		f->pixelformat = V4L2_PIX_FMT_H264_SLICE;
+		break;
+	case 1:
+		f->pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
+		break;
+	case 2:
+		f->pixelformat = V4L2_PIX_FMT_MPEG2_SLICE;
+		break;
+	case 3:
+		f->pixelformat = V4L2_PIX_FMT_MPEG4;
+		break;
+	case 4:
+		f->pixelformat = V4L2_PIX_FMT_VP8_FRAME;
+		break;
+	case 5:
+		f->pixelformat = V4L2_PIX_FMT_VP9_FRAME;
+		break;
+	case 6:
+		f->pixelformat = V4L2_PIX_FMT_VC1_ANNEX_G;
+		break;
+	case 7:
+		f->pixelformat = V4L2_PIX_FMT_VC1_ANNEX_L;
+		break;
+	/*
+	 * MPEG-1, RealVideo and DivX3 are not supported or enumerated.
+	 *
+	 *   MPEG-1
+	 *       The unfinished VDH path and its private slice ABI were removed;
+	 *       MPEG-1 is not supported by this driver.
+	 *
+	 *   RealVideo 8 and 9
+	 *       The unfinished parser, message and reference paths were removed;
+	 *       RealVideo is not supported by this driver.
+	 *
+	 * DivX3 is not listed for the same reason as RealVideo and one more:
+	 * this CV200 checkout ships no vdm_hal_divx3.S at all.  The HAL build
+	 * directory holds real8, real9, vp6, vp8, vp9, vc1, avs, h264, hevc,
+	 * mpeg2 and mpeg4 only, and vfmw_make.cfg guards the DivX3 objects
+	 * behind a findstring that never matches, so the build falls back to
+	 * a no-op stub.  There is no hardware path to remove.
+	 */
+	default:
 		return -EINVAL;
-	f->pixelformat = backend->formats[f->index];
+	}
+
 	return 0;
 }
 
 static int histb_vdec_enum_framesizes(struct file *file, void *priv,
 				      struct v4l2_frmsizeenum *fsize)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
-	const struct histb_vdec_backend *backend = ctx->vdec->backend;
 	u32 max_width, max_height;
-	/* H.264 controls describe macroblocks; other codecs carry pixel sizes. */
+	/*
+	 * Only H.264 keeps a 16-pixel step.  Its validator compares the
+	 * negotiated width against pic_width_in_mbs_minus1 * 16, so a size off
+	 * the macroblock grid cannot decode anyway and should be refused here.
+	 * Every other codec states its size in real pixels and is validated
+	 * against the aligned value, so 1920x1080 and 854x480 have to be
+	 * offered: a 16 step hid them and made ffmpeg fall back to software.
+	 */
 	u32 step = 1;
 
-	if (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
-	    fsize->pixel_format != V4L2_PIX_FMT_P010 &&
-	    !histb_vdec_backend_supports_format(backend, fsize->pixel_format))
+	if (fsize->index)
 		return -EINVAL;
-	if (fsize->pixel_format == V4L2_PIX_FMT_HEVC_SLICE ||
-	    fsize->pixel_format == V4L2_PIX_FMT_AVS2) {
+	if (fsize->pixel_format == V4L2_PIX_FMT_HEVC_SLICE) {
 		max_width = HISTB_VDEC_HEVC_MAX_WIDTH;
 		max_height = HISTB_VDEC_HEVC_MAX_HEIGHT;
 		step = 1;
@@ -14470,14 +13133,9 @@ static int histb_vdec_enum_framesizes(struct file *file, void *priv,
 		max_width = HISTB_VDEC_H264_MAX_WIDTH;
 		max_height = HISTB_VDEC_H264_MAX_HEIGHT;
 		step = 16;
-	} else if (fsize->pixel_format == V4L2_PIX_FMT_MPEG2_SLICE ||
-		   fsize->pixel_format == V4L2_PIX_FMT_MPEG1) {
+	} else if (fsize->pixel_format == V4L2_PIX_FMT_MPEG2_SLICE) {
 		max_width = HISTB_VDEC_MPEG2_MAX_WIDTH;
 		max_height = HISTB_VDEC_MPEG2_MAX_HEIGHT;
-	} else if (fsize->pixel_format == V4L2_PIX_FMT_AVS_SLICE) {
-		max_width = HISTB_VDEC_AVS_MAX_WIDTH;
-		max_height = HISTB_VDEC_AVS_MAX_HEIGHT;
-		step = 1;
 	} else if (fsize->pixel_format == V4L2_PIX_FMT_MPEG4) {
 		max_width = HISTB_VDEC_MPEG4_MAX_WIDTH;
 		max_height = HISTB_VDEC_MPEG4_MAX_HEIGHT;
@@ -14510,10 +13168,8 @@ static int histb_vdec_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
-static void histb_vdec_try_output_format(struct histb_vdec_ctx *ctx,
-					 struct v4l2_pix_format *pix)
+static void histb_vdec_try_output_format(struct v4l2_pix_format *pix)
 {
-	const struct histb_vdec_backend *backend = ctx->vdec->backend;
 	u32 max_width = HISTB_VDEC_H264_MAX_WIDTH;
 	u32 max_height = HISTB_VDEC_H264_MAX_HEIGHT;
 	u32 alignment = 4;
@@ -14521,27 +13177,13 @@ static void histb_vdec_try_output_format(struct histb_vdec_ctx *ctx,
 	u32 height = pix->height;
 	u32 pixelformat = pix->pixelformat;
 
-	if (!histb_vdec_backend_supports_format(backend, pixelformat) &&
-	    (pixelformat == V4L2_PIX_FMT_VP8_FRAME ||
-	     pixelformat == V4L2_PIX_FMT_VP9_FRAME))
-		pixelformat = V4L2_PIX_FMT_H264_SLICE;
-	if (pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
-	    (pixelformat == V4L2_PIX_FMT_AVS2 &&
-	     histb_vdec_backend_supports_format(backend, pixelformat))) {
+	if (pixelformat == V4L2_PIX_FMT_HEVC_SLICE) {
 		max_width = HISTB_VDEC_HEVC_MAX_WIDTH;
 		max_height = HISTB_VDEC_HEVC_MAX_HEIGHT;
 		alignment = 0;
-	} else if (pixelformat == V4L2_PIX_FMT_MPEG2_SLICE ||
-		   (pixelformat == V4L2_PIX_FMT_MPEG1 &&
-		    histb_vdec_backend_supports_format(backend, pixelformat))) {
+	} else if (pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
 		max_width = HISTB_VDEC_MPEG2_MAX_WIDTH;
 		max_height = HISTB_VDEC_MPEG2_MAX_HEIGHT;
-		if (pixelformat == V4L2_PIX_FMT_MPEG1)
-			alignment = 0;
-	} else if (pixelformat == V4L2_PIX_FMT_AVS_SLICE) {
-		max_width = HISTB_VDEC_AVS_MAX_WIDTH;
-		max_height = HISTB_VDEC_AVS_MAX_HEIGHT;
-		alignment = 0;
 	} else if (pixelformat == V4L2_PIX_FMT_MPEG4) {
 		max_width = HISTB_VDEC_MPEG4_MAX_WIDTH;
 		max_height = HISTB_VDEC_MPEG4_MAX_HEIGHT;
@@ -14581,8 +13223,7 @@ static void histb_vdec_try_output_format(struct histb_vdec_ctx *ctx,
 static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 					  struct v4l2_pix_format *pix)
 {
-	bool p010 = (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
-		ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) &&
+	bool p010 = ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
 		pix->pixelformat == V4L2_PIX_FMT_P010;
 	u32 width = pix->width ?: ctx->src.pix.width;
 	u32 height = pix->height ?: ctx->src.pix.height;
@@ -14595,9 +13236,7 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 	 * Upscaling remains an internal VC-1 RESPIC operation, not a public
 	 * capture-format promise.
 	 */
-	if ((ctx->vdec->mv310 && p010) ||
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2 ||
-	    (ctx->src.pix.width & 3) || (ctx->src.pix.height & 1)) {
+	if ((ctx->src.pix.width & 3) || (ctx->src.pix.height & 1)) {
 		width = ctx->src.pix.width;
 		height = ctx->src.pix.height;
 	} else {
@@ -14613,10 +13252,8 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 	pix->pixelformat = p010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 	pix->field = V4L2_FIELD_NONE;
 	/* Both public capture formats are linear; CV200 tile storage is internal. */
-	pix->bytesperline = p010 ? ALIGN(pix->width, 2) * 2 :
-		ALIGN(pix->width, 64);
-	pix->sizeimage = pix->bytesperline *
-		(pix->height + DIV_ROUND_UP(pix->height, 2));
+	pix->bytesperline = p010 ? pix->width * 2 : ALIGN(pix->width, 64);
+	pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
 	pix->colorspace = ctx->src.pix.colorspace;
 	pix->ycbcr_enc = ctx->src.pix.ycbcr_enc;
 	pix->quantization = ctx->src.pix.quantization;
@@ -14626,10 +13263,10 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 static int histb_vdec_try_fmt(struct file *file, void *priv,
 			      struct v4l2_format *f)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
 
 	if (V4L2_TYPE_IS_OUTPUT(f->type))
-		histb_vdec_try_output_format(ctx, &f->fmt.pix);
+		histb_vdec_try_output_format(&f->fmt.pix);
 	else
 		histb_vdec_try_capture_format(ctx, &f->fmt.pix);
 
@@ -14639,23 +13276,16 @@ static int histb_vdec_try_fmt(struct file *file, void *priv,
 static int histb_vdec_g_fmt(struct file *file, void *priv,
 			    struct v4l2_format *f)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
 
 	f->fmt.pix = histb_vdec_get_q_data(ctx, f->type)->pix;
-	if (V4L2_TYPE_IS_CAPTURE(f->type) && ctx->mpeg1 &&
-	    ctx->mpeg1->decoder.sequence_valid &&
-	    !ctx->mpeg1->capture_configured) {
-		f->fmt.pix.width = ctx->src.pix.width;
-		f->fmt.pix.height = ctx->src.pix.height;
-		histb_vdec_try_capture_format(ctx, &f->fmt.pix);
-	}
 	return 0;
 }
 
 static int histb_vdec_s_fmt(struct file *file, void *priv,
 				struct v4l2_format *f)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
 	struct vb2_queue *peer_vq, *vq;
 	int ret;
 
@@ -14664,8 +13294,26 @@ static int histb_vdec_s_fmt(struct file *file, void *priv,
 		return ret;
 
 	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
-	if (vb2_is_busy(vq))
+	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
+		/*
+		 * The OUTPUT format may be set again while its buffers are
+		 * allocated but not streaming, as long as they stay valid:
+		 * Chromium allocates 17 bitstream buffers, then on every
+		 * resolution change stops the queue and calls S_FMT with the
+		 * new picture size (it deallocates only the CAPTURE side).
+		 * Same codec and a size that fits the buffers is harmless.
+		 */
+		const struct v4l2_pix_format *old = &ctx->src.pix;
+
+		if (vb2_is_streaming(vq))
+			return -EBUSY;
+		if (vb2_is_busy(vq) &&
+		    (f->fmt.pix.pixelformat != old->pixelformat ||
+		     f->fmt.pix.sizeimage > old->sizeimage))
+			return -EBUSY;
+	} else if (vb2_is_busy(vq)) {
 		return -EBUSY;
+	}
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
 		peer_vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE);
 		if (vb2_is_busy(peer_vq))
@@ -14678,8 +13326,6 @@ static int histb_vdec_s_fmt(struct file *file, void *priv,
 
 		vq->requires_requests =
 			f->fmt.pix.pixelformat != V4L2_PIX_FMT_MPEG4 &&
-			f->fmt.pix.pixelformat != V4L2_PIX_FMT_AVS2 &&
-			f->fmt.pix.pixelformat != V4L2_PIX_FMT_MPEG1 &&
 			!histb_vdec_is_vc1_format(f->fmt.pix.pixelformat);
 		if (f->fmt.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE) {
 			vq->subsystem_flags |=
@@ -14691,15 +13337,6 @@ static int histb_vdec_s_fmt(struct file *file, void *priv,
 		histb_vdec_reset_h264_slices(ctx);
 		histb_vdec_reset_h264_field_pair(ctx);
 		histb_vdec_free_buffers(ctx);
-		v4l2_m2m_set_src_buffered(ctx->fh.m2m_ctx,
-			f->fmt.pix.pixelformat == V4L2_PIX_FMT_AVS2 ||
-			f->fmt.pix.pixelformat == V4L2_PIX_FMT_MPEG1);
-		v4l2_m2m_set_dst_buffered(ctx->fh.m2m_ctx,
-			f->fmt.pix.pixelformat == V4L2_PIX_FMT_AVS2 ||
-			f->fmt.pix.pixelformat == V4L2_PIX_FMT_MPEG1);
-		ctx->fh.m2m_ctx->ignore_cap_streaming =
-			f->fmt.pix.pixelformat == V4L2_PIX_FMT_AVS2 ||
-			f->fmt.pix.pixelformat == V4L2_PIX_FMT_MPEG1;
 		capture.width = f->fmt.pix.width;
 		capture.height = f->fmt.pix.height;
 		histb_vdec_try_capture_format(ctx, &capture);
@@ -14713,19 +13350,97 @@ static int histb_vdec_s_fmt(struct file *file, void *priv,
 			 (char *)&ctx->dst.pix.pixelformat);
 	}
 
-	if (V4L2_TYPE_IS_CAPTURE(f->type) && ctx->avs2)
-		ctx->avs2->capture_configured = true;
-	if (V4L2_TYPE_IS_CAPTURE(f->type) && ctx->mpeg1)
-		ctx->mpeg1->capture_configured = true;
 	return 0;
+}
+
+/*
+ * Multi-planar API.  A vb2 queue has ONE buffer type for its whole life and
+ * FFmpeg/GStreamer pick the *_MPLANE types whenever V4L2_CAP_VIDEO_M2M_MPLANE
+ * is advertised, so the multi-planar interface is a SECOND video node
+ * (vfd_mp) of the same device, sharing the m2m device, the hardware and every
+ * code path; only the queue types and the struct v4l2_format flavour differ.
+ * Every format here is one plane (compressed bitstream; NV12/P010 capture as
+ * one contiguous Y+UV plane), so the conversion is lossless.
+ */
+static void histb_vdec_mp_to_pix(const struct v4l2_pix_format_mplane *mp,
+				 struct v4l2_pix_format *pix)
+{
+	memset(pix, 0, sizeof(*pix));
+	pix->width = mp->width;
+	pix->height = mp->height;
+	pix->pixelformat = mp->pixelformat;
+	pix->field = mp->field;
+	pix->colorspace = mp->colorspace;
+	pix->ycbcr_enc = mp->ycbcr_enc;
+	pix->quantization = mp->quantization;
+	pix->xfer_func = mp->xfer_func;
+	pix->bytesperline = mp->plane_fmt[0].bytesperline;
+	pix->sizeimage = mp->plane_fmt[0].sizeimage;
+}
+
+static void histb_vdec_pix_to_mp(const struct v4l2_pix_format *pix,
+				 struct v4l2_pix_format_mplane *mp)
+{
+	memset(mp, 0, sizeof(*mp));
+	mp->width = pix->width;
+	mp->height = pix->height;
+	mp->pixelformat = pix->pixelformat;
+	mp->field = pix->field;
+	mp->colorspace = pix->colorspace;
+	mp->ycbcr_enc = pix->ycbcr_enc;
+	mp->quantization = pix->quantization;
+	mp->xfer_func = pix->xfer_func;
+	mp->num_planes = 1;
+	mp->plane_fmt[0].bytesperline = pix->bytesperline;
+	mp->plane_fmt[0].sizeimage = pix->sizeimage;
+}
+
+static int histb_vdec_g_fmt_mp(struct file *file, void *priv,
+			       struct v4l2_format *f)
+{
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
+
+	histb_vdec_pix_to_mp(&histb_vdec_get_q_data(ctx, f->type)->pix,
+			     &f->fmt.pix_mp);
+	return 0;
+}
+
+static int histb_vdec_try_fmt_mp(struct file *file, void *priv,
+				 struct v4l2_format *f)
+{
+	struct v4l2_format sp = {
+		.type = V4L2_TYPE_IS_OUTPUT(f->type) ?
+			V4L2_BUF_TYPE_VIDEO_OUTPUT : V4L2_BUF_TYPE_VIDEO_CAPTURE,
+	};
+	int ret;
+
+	histb_vdec_mp_to_pix(&f->fmt.pix_mp, &sp.fmt.pix);
+	ret = histb_vdec_try_fmt(file, priv, &sp);
+	if (!ret)
+		histb_vdec_pix_to_mp(&sp.fmt.pix, &f->fmt.pix_mp);
+	return ret;
+}
+
+static int histb_vdec_s_fmt_mp(struct file *file, void *priv,
+			       struct v4l2_format *f)
+{
+	struct v4l2_format sp = {
+		.type = V4L2_TYPE_IS_OUTPUT(f->type) ?
+			V4L2_BUF_TYPE_VIDEO_OUTPUT : V4L2_BUF_TYPE_VIDEO_CAPTURE,
+	};
+	int ret;
+
+	histb_vdec_mp_to_pix(&f->fmt.pix_mp, &sp.fmt.pix);
+	ret = histb_vdec_s_fmt(file, priv, &sp);
+	if (!ret)
+		histb_vdec_pix_to_mp(&sp.fmt.pix, &f->fmt.pix_mp);
+	return ret;
 }
 
 static int histb_vdec_try_decoder_cmd(struct file *file, void *priv,
 				      struct v4l2_decoder_cmd *dc)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
-	if (ctx->mvc_ingress.subset.is_valid && dc->cmd != V4L2_DEC_CMD_FLUSH)
-		return v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
 
 	if (histb_vdec_is_stateless_format(ctx->src.pix.pixelformat))
 		return v4l2_m2m_ioctl_stateless_try_decoder_cmd(file, priv, dc);
@@ -14736,7 +13451,7 @@ static int histb_vdec_try_decoder_cmd(struct file *file, void *priv,
 static int histb_vdec_decoder_cmd(struct file *file, void *priv,
 				  struct v4l2_decoder_cmd *dc)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct histb_mpeg4_display_plan plan;
 	struct histb_mpeg4_display_state state;
@@ -14748,80 +13463,6 @@ static int histb_vdec_decoder_cmd(struct file *file, void *priv,
 	ret = histb_vdec_try_decoder_cmd(file, priv, dc);
 	if (ret)
 		return ret;
-	if (ctx->mvc_ingress.subset.is_valid && dc->cmd == V4L2_DEC_CMD_STOP &&
-	    !v4l2_m2m_num_src_bufs_ready(m2m_ctx)) {
-		mutex_lock(&ctx->mvc_lock);
-		ret = histb_mvc_ingress_drain(&ctx->mvc_ingress);
-		if (!ret && !histb_mvc_ingress_drained(&ctx->mvc_ingress))
-			ret = -EBUSY;
-		mutex_unlock(&ctx->mvc_lock);
-		if (ret)
-			return ret;
-	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1) {
-		struct histb_vdec_mpeg1 *mp = ctx->mpeg1;
-
-		if (!mp)
-			return -EINVAL;
-		mutex_lock(&mp->lock);
-		if (dc->cmd == V4L2_DEC_CMD_START) {
-			if (m2m_ctx->is_draining && !v4l2_m2m_has_stopped(m2m_ctx)) {
-				ret = -EBUSY;
-			} else {
-				v4l2_m2m_clear_state(m2m_ctx);
-				vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m_ctx));
-				/* START acknowledges an unchanged initial CAPTURE layout. */
-				mp->capture_configured = true;
-				mp->eos = false;
-				mp->drain = false;
-			}
-		} else if (dc->cmd == V4L2_DEC_CMD_STOP) {
-			if (m2m_ctx->is_draining) {
-				ret = -EBUSY;
-			} else {
-				m2m_ctx->last_src_buf = v4l2_m2m_last_src_buf(m2m_ctx);
-				m2m_ctx->is_draining = true;
-				if (!m2m_ctx->last_src_buf) {
-					mp->eos = true;
-					mp->drain = true;
-				}
-			}
-		} else {
-			ret = -EINVAL;
-		}
-		mutex_unlock(&mp->lock);
-		if (!ret)
-			v4l2_m2m_try_schedule(m2m_ctx);
-		return ret;
-	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) {
-		if (!ctx->avs2)
-			return -EINVAL;
-		mutex_lock(&ctx->avs2->lock);
-		if (dc->cmd == V4L2_DEC_CMD_START) {
-			v4l2_m2m_clear_state(m2m_ctx);
-			ctx->avs2->eos = false;
-			ctx->avs2->drain = false;
-		} else if (dc->cmd == V4L2_DEC_CMD_STOP) {
-			if (m2m_ctx->is_draining) {
-				ret = -EBUSY;
-			} else {
-				m2m_ctx->last_src_buf = v4l2_m2m_last_src_buf(m2m_ctx);
-				m2m_ctx->is_draining = true;
-				if (!m2m_ctx->last_src_buf) {
-					ctx->avs2->eos = true;
-					ctx->avs2->drain = true;
-				}
-			}
-		} else {
-			ret = -EINVAL;
-		}
-		mutex_unlock(&ctx->avs2->lock);
-		if (ret)
-			return ret;
-		v4l2_m2m_try_schedule(m2m_ctx);
-		return 0;
-	}
 	if (dc->cmd == V4L2_DEC_CMD_FLUSH) {
 		/*
 		 * FLUSH only releases a capture buffer held by the stateless m2m
@@ -14830,22 +13471,6 @@ static int histb_vdec_decoder_cmd(struct file *file, void *priv,
 		queued_src = !!v4l2_m2m_last_src_buf(m2m_ctx);
 		last_dst = v4l2_m2m_last_dst_buf(m2m_ctx);
 		held = last_dst && last_dst->is_held;
-		spin_lock_irqsave(&ctx->vdec->irqlock, flags);
-		active = ctx->vdec->curr_ctx == ctx || ctx->vdec->post_ctx == ctx;
-		spin_unlock_irqrestore(&ctx->vdec->irqlock, flags);
-		if (ctx->mvc_ingress.subset.is_valid && !active && !queued_src && held) {
-			struct vb2_v4l2_buffer *dst = v4l2_m2m_dst_buf_remove(m2m_ctx);
-			unsigned int i;
-
-			histb_vdec_finish_mvc(ctx, histb_vdec_decoded_buffer(dst), false, false);
-			dst->is_held = false;
-			for (i = 0; i < dst->vb2_buf.num_planes; i++)
-				vb2_set_plane_payload(&dst->vb2_buf, i, 0);
-			histb_vdec_reset_h264_slices(ctx);
-			histb_vdec_reset_h264_field_pair(ctx);
-			v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
-			return 0;
-		}
 		ret = v4l2_m2m_ioctl_stateless_decoder_cmd(file, priv, dc);
 		if (ret)
 			return ret;
@@ -14877,11 +13502,6 @@ static int histb_vdec_decoder_cmd(struct file *file, void *priv,
 				if (ctx->h264_pending_field)
 					ctx->dst.sequence++;
 				histb_vdec_reset_h264_field_pair(ctx);
-				if (ctx->mvc_ingress.subset.is_valid) {
-					mutex_lock(&ctx->mvc_lock);
-					ctx->mvc_ingress.draining = false;
-					mutex_unlock(&ctx->mvc_lock);
-				}
 			}
 		}
 		if (mpeg4)
@@ -15005,7 +13625,6 @@ static int histb_vdec_subscribe_event(
 {
 	switch (sub->type) {
 	case V4L2_EVENT_EOS:
-	case V4L2_EVENT_SOURCE_CHANGE:
 		return v4l2_event_subscribe(fh, sub, 0, NULL);
 	case V4L2_EVENT_CTRL:
 		return v4l2_ctrl_subscribe_event(fh, sub);
@@ -15021,7 +13640,7 @@ static int histb_vdec_subscribe_event(
 static long histb_vdec_default_ioctl(struct file *file, void *priv,
 				     bool valid_prio, unsigned int cmd, void *arg)
 {
-	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+	struct histb_vdec_ctx *ctx = file_to_histb_vdec_ctx(file);
 	struct histb_vpss_dei_request *job = arg;
 	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
 	struct vb2_buffer *source[4], *dst;
@@ -15042,7 +13661,7 @@ static long histb_vdec_default_ioctl(struct file *file, void *priv,
 	if (ctx->dst.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
 	    ctx->dst.pix.width > 1920 || ctx->dst.pix.height > 1088 ||
 	    (ctx->dst.pix.height & 1) || job->bottom_mask & ~0xfU ||
-	    job->flags & ~(HISTB_VPSS_DEI_TOP_FIELD_FIRST | HISTB_VPSS_DEI_MCDI_EN | HISTB_VPSS_DEI_TNR_EN))
+	    job->flags & ~HISTB_VPSS_DEI_TOP_FIELD_FIRST || job->reserved)
 		return -EINVAL;
 
 	dst = vb2_get_buffer(q, job->destination);
@@ -15080,20 +13699,11 @@ static long histb_vdec_default_ioctl(struct file *file, void *priv,
 	frame.height = ctx->dst.pix.height / 2;
 	frame.stride = stride;
 	frame.output_stride = stride;
-	frame.target_width = job->target_width;
-	frame.target_height = job->target_height;
 	frame.top_field_first = job->flags & HISTB_VPSS_DEI_TOP_FIELD_FIRST;
 	frame.bottom_field = job->bottom_mask & BIT(1);
-	frame.mcdi_en = !!(job->flags & HISTB_VPSS_DEI_MCDI_EN);
-	frame.tnr_en = !!(job->flags & HISTB_VPSS_DEI_TNR_EN);
-	frame.pq = ctx->pq_settings;
 	ret = histb_vpss_dei(ctx->vdec->vpss, &frame, output);
-	for (i = 0; i < ARRAY_SIZE(source); i++)
-		histb_vdec_capture_begin_cpu_access(source[i]);
 	if (!ret)
 		ret = histb_vdec_capture_begin_cpu_access(dst);
-	else
-		histb_vdec_capture_begin_cpu_access(dst);
 	return ret;
 }
 
@@ -15107,6 +13717,12 @@ static const struct v4l2_ioctl_ops histb_vdec_ioctl_ops = {
 	.vidioc_g_fmt_vid_out = histb_vdec_g_fmt,
 	.vidioc_try_fmt_vid_out = histb_vdec_try_fmt,
 	.vidioc_s_fmt_vid_out = histb_vdec_s_fmt,
+	.vidioc_g_fmt_vid_cap_mplane = histb_vdec_g_fmt_mp,
+	.vidioc_try_fmt_vid_cap_mplane = histb_vdec_try_fmt_mp,
+	.vidioc_s_fmt_vid_cap_mplane = histb_vdec_s_fmt_mp,
+	.vidioc_g_fmt_vid_out_mplane = histb_vdec_g_fmt_mp,
+	.vidioc_try_fmt_vid_out_mplane = histb_vdec_try_fmt_mp,
+	.vidioc_s_fmt_vid_out_mplane = histb_vdec_s_fmt_mp,
 	.vidioc_enum_framesizes = histb_vdec_enum_framesizes,
 	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
@@ -15128,26 +13744,6 @@ static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
 	{ .id = V4L2_CID_STATELESS_VP8_FRAME },
 	{ .id = V4L2_CID_STATELESS_VP9_FRAME },
 	{ .id = V4L2_CID_STATELESS_VP9_COMPRESSED_HDR },
-	{ .id = V4L2_CID_STATELESS_AVS_SEQUENCE },
-	{ .id = V4L2_CID_STATELESS_AVS_PICTURE },
-	{
-		.id = V4L2_CID_STATELESS_AVS_SLICE_PARAMS,
-		.dims = { HISTB_VDEC_AVS_MAX_SLICES },
-	},
-	{ .id = V4L2_CID_STATELESS_AVS_DECODE_PARAMS },
-	{
-		/* AVS uses frame-based requests with prefixed start codes. */
-		.id = V4L2_CID_STATELESS_AVS_DECODE_MODE,
-		.min = V4L2_STATELESS_AVS_DECODE_MODE_FRAME_BASED,
-		.max = V4L2_STATELESS_AVS_DECODE_MODE_FRAME_BASED,
-		.def = V4L2_STATELESS_AVS_DECODE_MODE_FRAME_BASED,
-	},
-	{
-		.id = V4L2_CID_STATELESS_AVS_START_CODE,
-		.min = V4L2_STATELESS_AVS_START_CODE_PREFIX,
-		.max = V4L2_STATELESS_AVS_START_CODE_PREFIX,
-		.def = V4L2_STATELESS_AVS_START_CODE_PREFIX,
-	},
 	{ .id = V4L2_CID_STATELESS_MPEG2_SEQUENCE },
 	{ .id = V4L2_CID_STATELESS_MPEG2_PICTURE },
 	{ .id = V4L2_CID_STATELESS_MPEG2_QUANTISATION },
@@ -15158,16 +13754,25 @@ static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
 	{ .id = V4L2_CID_STATELESS_H264_PRED_WEIGHTS },
 	{ .id = V4L2_CID_STATELESS_H264_SLICE_PARAMS },
 	{
-		/* Request validation rejects frame-based H.264 input. */
+		/* Pinned (min == max == def): the core answers a client that
+		 * asks for FRAME_BASED with -ERANGE, and VIDIOC_QUERYMENU lists
+		 * only what the driver really does.  One slice per request,
+		 * HOLD_CAPTURE_BUF between the slices of a picture. */
 		.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
 		.min = V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
+		/* FRAME_BASED is accepted for Chromium: the driver parses the
+		 * slice headers itself.  The default stays SLICE_BASED, which
+		 * is what FFmpeg and GStreamer read and use. */
 		.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
 		.def = V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
 	},
 	{
-		/* Both raw NALs and Annex B request framing are supported. */
+		/* Pinned.  The slice buffer is the bare NAL unit: the driver
+		 * feeds it to ebsp_to_rbsp() as is and never skips a start code. */
 		.id = V4L2_CID_STATELESS_H264_START_CODE,
 		.min = V4L2_STATELESS_H264_START_CODE_NONE,
+		/* ANNEX_B is only ever the default under h264_frame_default
+		 * (a test switch); SLICE_BASED ignores it. */
 		.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
 		.def = V4L2_STATELESS_H264_START_CODE_NONE,
 	},
@@ -15180,6 +13785,9 @@ static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
 	{
 		.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL,
 		.min = V4L2_MPEG_VIDEO_H264_LEVEL_1_0,
+		/* The datasheet states level 5.0 (4Kx2K@30); the BSP header
+		 * says 4.1.  The datasheet is the public statement of the part
+		 * and outranks a software guard. */
 		.max = V4L2_MPEG_VIDEO_H264_LEVEL_5_0,
 		.def = V4L2_MPEG_VIDEO_H264_LEVEL_5_0,
 	},
@@ -15197,13 +13805,24 @@ static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
 		.max = U32_MAX,
 		.step = 1,
 	},
-	/* These integer selectors are checked again when the request is queued. */
+	/*
+	 * The four HEVC menu controls (decode mode, start code, profile, level)
+	 * used to be listed here.  They were never read by the driver - the
+	 * capability is expressed by the stateless controls above - and they
+	 * could not be registered at all: only cfg->type is given, so the core
+	 * has no qmenu for a menu-type control and v4l2_ctrl_new_custom() fails
+	 * with -ERANGE.  That error lands in ctrl_handler.error, which
+	 * histb_vdec_init_ctrls() returns, so open() failed with -ERANGE and no
+	 * client could reach the hardware at all.  Verified with a per-control
+	 * diagnostic: indices 31-34, name=HEVC Decode Mode/Start Code/Profile/
+	 * Level, type=0, err=-34, while all 31 controls before them registered.
+	 */
 	{
 		.name = "HEVC Decode Mode",
 		.id = V4L2_CID_STATELESS_HEVC_DECODE_MODE,
 		.type = V4L2_CTRL_TYPE_INTEGER,
 		.step = 1,
-		.min = V4L2_STATELESS_HEVC_DECODE_MODE_SLICE_BASED,
+		.min = V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED,
 		.max = V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED,
 		.def = V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED,
 	},
@@ -15213,39 +13832,18 @@ static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
 		.type = V4L2_CTRL_TYPE_INTEGER,
 		.step = 1,
 		.min = V4L2_STATELESS_HEVC_START_CODE_NONE,
-		.max = V4L2_STATELESS_HEVC_START_CODE_ANNEX_B,
+		.max = V4L2_STATELESS_HEVC_START_CODE_NONE,
 		.def = V4L2_STATELESS_HEVC_START_CODE_NONE,
 	},
-};
-static int histb_vdec_s_ctrl(struct v4l2_ctrl *ctrl)
-{
-	struct histb_vdec_ctx *ctx =
-		container_of(ctrl->handler, struct histb_vdec_ctx, ctrl_handler);
-
-	switch (ctrl->id) {
-	case V4L2_CID_BRIGHTNESS:
-		ctx->pq_settings.brightness = ctrl->val;
-		break;
-	case V4L2_CID_CONTRAST:
-		ctx->pq_settings.contrast = ctrl->val;
-		break;
-	case V4L2_CID_SATURATION:
-		ctx->pq_settings.saturation = ctrl->val;
-		break;
-	case V4L2_CID_HUE:
-		ctx->pq_settings.hue = ctrl->val;
-		break;
-	case V4L2_CID_SHARPNESS:
-		ctx->pq_settings.sharpness = ctrl->val;
-		break;
-	default:
-		break;
-	}
-	return 0;
-}
-
-static const struct v4l2_ctrl_ops histb_vdec_ctrl_ops = {
-	.s_ctrl = histb_vdec_s_ctrl,
+	{
+		.name = "Deinterlace",
+		.id = HISTB_VDEC_CID_DEINTERLACE,
+		.type = V4L2_CTRL_TYPE_MENU,
+		.min = 0,
+		.max = 1,
+		.def = 0,
+		.qmenu = histb_vdec_deint_menu,
+	},
 };
 
 static int histb_vdec_init_ctrls(struct histb_vdec_ctx *ctx)
@@ -15254,20 +13852,22 @@ static int histb_vdec_init_ctrls(struct histb_vdec_ctx *ctx)
 	int ret;
 
 	v4l2_ctrl_handler_init(&ctx->ctrl_handler,
-			       ARRAY_SIZE(histb_vdec_ctrls) + 5);
-	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_vdec_ctrl_ops,
-			  V4L2_CID_BRIGHTNESS, 0, 100, 1, 50);
-	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_vdec_ctrl_ops,
-			  V4L2_CID_CONTRAST, 0, 100, 1, 50);
-	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_vdec_ctrl_ops,
-			  V4L2_CID_SATURATION, 0, 100, 1, 50);
-	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_vdec_ctrl_ops,
-			  V4L2_CID_HUE, 0, 100, 1, 50);
-	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_vdec_ctrl_ops,
-			  V4L2_CID_SHARPNESS, 0, 100, 1, 50);
-	for (i = 0; i < ARRAY_SIZE(histb_vdec_ctrls); i++)
-		v4l2_ctrl_new_custom(&ctx->ctrl_handler,
-				     &histb_vdec_ctrls[i], ctx);
+			       ARRAY_SIZE(histb_vdec_ctrls));
+	for (i = 0; i < ARRAY_SIZE(histb_vdec_ctrls); i++) {
+		struct v4l2_ctrl_config cfg = histb_vdec_ctrls[i];
+
+		/* Test switch: advertise FRAME_BASED + Annex-B as the H.264 defaults, which is
+		 * what makes FFmpeg's v4l2request hwaccel drive the frame-based path. */
+		if (cfg.id == HISTB_VDEC_CID_DEINTERLACE)
+			cfg.def = clamp(deinterlace, 0, 1);
+		if (h264_frame_default) {
+			if (cfg.id == V4L2_CID_STATELESS_H264_DECODE_MODE)
+				cfg.def = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED;
+			if (cfg.id == V4L2_CID_STATELESS_H264_START_CODE)
+				cfg.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B;
+		}
+		v4l2_ctrl_new_custom(&ctx->ctrl_handler, &cfg, ctx);
+	}
 	if (ctx->ctrl_handler.error) {
 		int ret = ctx->ctrl_handler.error;
 
@@ -15288,7 +13888,7 @@ static void histb_vdec_set_default_formats(struct histb_vdec_ctx *ctx)
 	ctx->src.pix.width = HISTB_VDEC_DEFAULT_WIDTH;
 	ctx->src.pix.height = HISTB_VDEC_DEFAULT_HEIGHT;
 	ctx->src.pix.sizeimage = HISTB_VDEC_DEFAULT_BITSTREAM;
-	histb_vdec_try_output_format(ctx, &ctx->src.pix);
+	histb_vdec_try_output_format(&ctx->src.pix);
 	ctx->dst.pix.width = HISTB_VDEC_DEFAULT_WIDTH;
 	ctx->dst.pix.height = HISTB_VDEC_DEFAULT_HEIGHT;
 	histb_vdec_try_capture_format(ctx, &ctx->dst.pix);
@@ -15305,19 +13905,12 @@ static int histb_vdec_open(struct file *file)
 		return -ENOMEM;
 
 	ctx->vdec = vdec;
+	ctx->mplane = video_devdata(file) == &vdec->vfd_mp;
 	mutex_init(&ctx->mpeg4_lock);
 	mutex_init(&ctx->vc1_lock);
-	mutex_init(&ctx->rv_lock);
 	init_completion(&ctx->vc1_setup_idle);
 	complete(&ctx->vc1_setup_idle);
-	mutex_init(&ctx->mvc_lock);
-	histb_mvc_ingress_init(&ctx->mvc_ingress);
 	histb_vdec_set_default_formats(ctx);
-	ctx->pq_settings.brightness = 50;
-	ctx->pq_settings.contrast = 50;
-	ctx->pq_settings.saturation = 50;
-	ctx->pq_settings.hue = 50;
-	ctx->pq_settings.sharpness = 50;
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 	file->private_data = &ctx->fh;
 
@@ -15347,11 +13940,23 @@ static int histb_vdec_release(struct file *file)
 {
 	struct histb_vdec_ctx *ctx =
 		container_of(file->private_data, struct histb_vdec_ctx, fh);
+	unsigned long flags;
+	bool busy;
 
+	/*
+	 * A dying file can still own the running job or the pipelined
+	 * post-process; quiesce both before the m2m context and ctx go away.
+	 */
+	spin_lock_irqsave(&ctx->vdec->irqlock, flags);
+	busy = ctx->vdec->curr_ctx == ctx || ctx->vdec->post_ctx == ctx;
+	spin_unlock_irqrestore(&ctx->vdec->irqlock, flags);
+	if (busy)
+		histb_vdec_abort(ctx);
+	if (READ_ONCE(h264_selfcheck) && h264_selfcheck_total)
+		dev_info(ctx->vdec->dev, "h264 selfcheck: %lu slices, %lu mismatches (at close)\n",
+			 h264_selfcheck_total, h264_selfcheck_bad);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	histb_vdec_free_buffers(ctx);
-	histb_vdec_free_dma_buffer(ctx->vdec->dev, &ctx->mvc_pmv, false);
-	kvfree(ctx->mvc_rbsp);
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 	v4l2_fh_del(&ctx->fh);
 	v4l2_fh_exit(&ctx->fh);
@@ -15368,13 +13973,25 @@ static const struct v4l2_file_operations histb_vdec_fops = {
 	.mmap = v4l2_m2m_fop_mmap,
 };
 
+/*
+ * A request must carry the controls that change on EVERY request; the rest
+ * keep their last value in ctx->ctrl_handler (v4l2_ctrl_request_setup() only
+ * applies what the client put into the request).  Standard clients
+ * rely on that: GStreamer v4l2codecs sends the SPS once per sequence, the
+ * PPS/DECODE_PARAMS with the first slice of a picture, SCALING_MATRIX only
+ * when the stream has one, and a sub-request for slice N > 0 holds just
+ * SLICE_PARAMS + PRED_WEIGHTS.  v4l2_ctrl_request_hdl_ctrl_find() reports
+ * only controls set in THIS request (p_req_valid), so asking it for SPS,
+ * PPS or SCALING_MATRIX rejected every request that legitimately omitted one.
+ * A client that never sent an SPS/PPS/DECODE_PARAMS is caught later by
+ * histb_vdec_validate_h264() (zeroed control -> -EINVAL on the buffer).
+ */
 static int histb_vdec_request_validate(struct media_request *request)
 {
 	struct media_request_object *obj;
 	struct v4l2_ctrl_handler *hdl;
 	struct histb_vdec_ctx *ctx = NULL;
 	static const u32 mpeg2_controls[] = {
-		V4L2_CID_STATELESS_MPEG2_SEQUENCE,
 		V4L2_CID_STATELESS_MPEG2_PICTURE,
 	};
 	static const u32 vp8_controls[] = {
@@ -15384,22 +14001,10 @@ static int histb_vdec_request_validate(struct media_request *request)
 		V4L2_CID_STATELESS_VP9_FRAME,
 		V4L2_CID_STATELESS_VP9_COMPRESSED_HDR,
 	};
-	static const u32 avs_controls[] = {
-		V4L2_CID_STATELESS_AVS_SEQUENCE,
-		V4L2_CID_STATELESS_AVS_PICTURE,
-		V4L2_CID_STATELESS_AVS_SLICE_PARAMS,
-		V4L2_CID_STATELESS_AVS_DECODE_PARAMS,
-	};
 	static const u32 h264_controls[] = {
-		V4L2_CID_STATELESS_H264_SPS,
-		V4L2_CID_STATELESS_H264_PPS,
-		V4L2_CID_STATELESS_H264_SCALING_MATRIX,
 		V4L2_CID_STATELESS_H264_SLICE_PARAMS,
-		V4L2_CID_STATELESS_H264_DECODE_PARAMS,
 	};
 	static const u32 hevc_controls[] = {
-		V4L2_CID_STATELESS_HEVC_SPS,
-		V4L2_CID_STATELESS_HEVC_PPS,
 		V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
 		V4L2_CID_STATELESS_HEVC_DECODE_PARAMS,
 	};
@@ -15436,11 +14041,28 @@ static int histb_vdec_request_validate(struct media_request *request)
 		required = vp9_controls;
 		required_count = ARRAY_SIZE(vp9_controls);
 		break;
-	case V4L2_PIX_FMT_AVS_SLICE:
-		required = avs_controls;
-		required_count = ARRAY_SIZE(avs_controls);
-		break;
 	case V4L2_PIX_FMT_H264_SLICE:
+		/*
+		 * FRAME_BASED clients send no SLICE_PARAMS: the request then
+		 * carries DECODE_PARAMS, and the mode is either in the request
+		 * (Chromium sets DECODE_MODE every time) or already the current
+		 * value (FFmpeg sets it once at init).
+		 */
+		hdl = v4l2_ctrl_request_hdl_find(request, &ctx->ctrl_handler);
+		if (hdl) {
+			bool frame_mode =
+				!v4l2_ctrl_request_hdl_ctrl_find(hdl,
+					V4L2_CID_STATELESS_H264_SLICE_PARAMS) &&
+				v4l2_ctrl_request_hdl_ctrl_find(hdl,
+					V4L2_CID_STATELESS_H264_DECODE_PARAMS) &&
+				(v4l2_ctrl_request_hdl_ctrl_find(hdl,
+					V4L2_CID_STATELESS_H264_DECODE_MODE) ||
+				 histb_vdec_h264_frame_based(ctx));
+
+			v4l2_ctrl_request_hdl_put(hdl);
+			if (frame_mode)
+				break;
+		}
 		required = h264_controls;
 		required_count = ARRAY_SIZE(h264_controls);
 		break;
@@ -15453,46 +14075,18 @@ static int histb_vdec_request_validate(struct media_request *request)
 	}
 	if (required_count) {
 		hdl = v4l2_ctrl_request_hdl_find(request, &ctx->ctrl_handler);
-		if (!hdl)
-			return -ENOENT;
+		if (!hdl) {
+			dev_dbg(ctx->vdec->dev,
+				"request carries no controls\n");
+			return -EINVAL;
+		}
 		for (i = 0; i < required_count; i++) {
 			if (!v4l2_ctrl_request_hdl_ctrl_find(hdl, required[i])) {
+				dev_dbg(ctx->vdec->dev,
+					"request lacks control 0x%x\n",
+					required[i]);
 				v4l2_ctrl_request_hdl_put(hdl);
-				return -ENOENT;
-			}
-		}
-		/*
-		 * The mode and start-code controls are registered with their full
-		 * range so that a client asking for an unsupported combination is
-		 * told, rather than silently clamped to what the driver assumes.
-		 */
-		{
-			static const struct {
-				u32 id;
-				s32 want;
-			} fixed[] = {
-				{ V4L2_CID_STATELESS_H264_DECODE_MODE,
-				  V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED },
-				{ V4L2_CID_STATELESS_HEVC_DECODE_MODE,
-				  V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED },
-				{ V4L2_CID_STATELESS_HEVC_START_CODE,
-				  V4L2_STATELESS_HEVC_START_CODE_NONE },
-			};
-			unsigned int k;
-
-			for (k = 0; k < ARRAY_SIZE(fixed); k++) {
-				struct v4l2_ctrl *c;
-
-				c = v4l2_ctrl_request_hdl_ctrl_find(hdl, fixed[k].id);
-				if (c && c->p_cur.p && c->p_cur.p_s32 &&
-				    c->p_cur.p_s32[0] != fixed[k].want) {
-					dev_err(ctx->vdec->dev,
-						"control 0x%x: %d is not supported, only %d\n",
-						fixed[k].id, c->p_cur.p_s32[0],
-						fixed[k].want);
-					v4l2_ctrl_request_hdl_put(hdl);
-					return -EINVAL;
-				}
+				return -EINVAL;
 			}
 		}
 		v4l2_ctrl_request_hdl_put(hdl);
@@ -15510,16 +14104,6 @@ static int histb_vdec_runtime_resume(struct device *dev)
 {
 	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
 	int ret;
-	if (vdec->mv310) {
-		ret = histb_vdec_configure_vdh_clock(vdec);
-		if (ret)
-			return ret;
-		writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
-		writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
-		writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
-		enable_irq(vdec->irq);
-		return 0;
-	}
 
 	ret = clk_bulk_prepare_enable(ARRAY_SIZE(vdec->clocks), vdec->clocks);
 	if (ret)
@@ -15533,8 +14117,7 @@ static int histb_vdec_runtime_resume(struct device *dev)
 		return ret;
 	}
 
-	/* AVS enables its identity table immediately before each task. */
-	histb_vdec_program_smmu(vdec, false);
+	histb_vdec_smmu_bypass(vdec);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	enable_irq(vdec->irq);
@@ -15545,17 +14128,11 @@ static int histb_vdec_runtime_suspend(struct device *dev)
 {
 	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
 
-	vdec->avsp_loaded = false;
-	if (histb_media_smmu_ready(&vdec->smmu))
-		vdec->smmu.identity_needs_reset = true;
-
 	disable_irq(vdec->irq);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
 	writel(0, vdec->regs + HISTB_VDEC_START);
-	histb_vdec_program_smmu(vdec, false);
+	histb_vdec_smmu_bypass(vdec);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
-	if (vdec->mv310)
-		return vdec->backend->reset_vdh(vdec);
 	reset_control_bulk_assert(ARRAY_SIZE(vdec->resets), vdec->resets);
 	clk_bulk_disable_unprepare(ARRAY_SIZE(vdec->clocks), vdec->clocks);
 	return 0;
@@ -15591,6 +14168,53 @@ static const struct dev_pm_ops histb_vdec_pm_ops = {
 			   histb_vdec_runtime_resume, NULL)
 	SET_SYSTEM_SLEEP_PM_OPS(histb_vdec_suspend, histb_vdec_resume)
 };
+
+/*
+ * The m2m helper builds the media graph (source -> processor -> sink, plus one
+ * V4L interface) for the first video node only.  Give the multi-planar node
+ * its own interface linked to the same DMA entities, so that a client that
+ * resolves a video node's major:minor through MEDIA_IOC_G_TOPOLOGY (v4l2-ctl,
+ * and anything that pairs video and media nodes) finds it.
+ */
+static int histb_vdec_register_mplane_intf(struct histb_vdec_dev *vdec)
+{
+	struct media_entity *src = &vdec->vfd.entity, *proc = NULL, *sink = NULL;
+	struct media_link *l;
+
+	list_for_each_entry(l, &src->links, list)
+		if (l->source->entity == src)
+			proc = l->sink->entity;
+	if (!proc)
+		return 0;
+	list_for_each_entry(l, &proc->links, list)
+		if (l->source->entity == proc)
+			sink = l->sink->entity;
+	if (!sink)
+		return 0;
+	vdec->mp_intf = media_devnode_create(&vdec->mdev, MEDIA_INTF_T_V4L_VIDEO,
+					     0, VIDEO_MAJOR, vdec->vfd_mp.minor);
+	if (!vdec->mp_intf)
+		return -ENOMEM;
+	if (!media_create_intf_link(src, &vdec->mp_intf->intf,
+				    MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED) ||
+	    !media_create_intf_link(sink, &vdec->mp_intf->intf,
+				    MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED)) {
+		media_remove_intf_links(&vdec->mp_intf->intf);
+		media_devnode_remove(vdec->mp_intf);
+		vdec->mp_intf = NULL;
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static void histb_vdec_unregister_mplane_intf(struct histb_vdec_dev *vdec)
+{
+	if (!vdec->mp_intf)
+		return;
+	media_remove_intf_links(&vdec->mp_intf->intf);
+	media_devnode_remove(vdec->mp_intf);
+	vdec->mp_intf = NULL;
+}
 
 static int histb_vdec_register_video(struct histb_vdec_dev *vdec)
 {
@@ -15629,20 +14253,40 @@ static int histb_vdec_register_video(struct histb_vdec_dev *vdec)
 	if (ret)
 		goto cleanup_media;
 
+	strscpy(vdec->vfd_mp.name, "histb-vdec-mplane", sizeof(vdec->vfd_mp.name));
+	vdec->vfd_mp.fops = &histb_vdec_fops;
+	vdec->vfd_mp.ioctl_ops = &histb_vdec_ioctl_ops;
+	vdec->vfd_mp.v4l2_dev = &vdec->v4l2_dev;
+	vdec->vfd_mp.lock = &vdec->lock;
+	vdec->vfd_mp.release = video_device_release_empty;
+	vdec->vfd_mp.vfl_dir = VFL_DIR_M2M;
+	vdec->vfd_mp.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
+	video_set_drvdata(&vdec->vfd_mp, vdec);
+	ret = video_register_device(&vdec->vfd_mp, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		goto unregister_video;
+
 	ret = v4l2_m2m_register_media_controller(vdec->m2m_dev, &vdec->vfd,
 						 MEDIA_ENT_F_PROC_VIDEO_DECODER);
 	if (ret)
 		goto unregister_video;
 
-	ret = media_device_register(&vdec->mdev);
+	ret = histb_vdec_register_mplane_intf(vdec);
 	if (ret)
 		goto unregister_media_controller;
 
+	ret = media_device_register(&vdec->mdev);
+	if (ret)
+		goto unregister_mp_intf;
+
 	return 0;
 
+unregister_mp_intf:
+	histb_vdec_unregister_mplane_intf(vdec);
 unregister_media_controller:
 	v4l2_m2m_unregister_media_controller(vdec->m2m_dev);
 unregister_video:
+	video_unregister_device(&vdec->vfd_mp);
 	video_unregister_device(&vdec->vfd);
 cleanup_media:
 	media_device_cleanup(&vdec->mdev);
@@ -15655,7 +14299,9 @@ unregister_v4l2:
 static void histb_vdec_unregister_video(struct histb_vdec_dev *vdec)
 {
 	media_device_unregister(&vdec->mdev);
+	histb_vdec_unregister_mplane_intf(vdec);
 	v4l2_m2m_unregister_media_controller(vdec->m2m_dev);
+	video_unregister_device(&vdec->vfd_mp);
 	video_unregister_device(&vdec->vfd);
 	media_device_cleanup(&vdec->mdev);
 	v4l2_m2m_release(vdec->m2m_dev);
@@ -15690,7 +14336,7 @@ static bool histb_vdec_pool_unreachable(struct device *dev)
 	if (!limit || limit > dma_get_mask(dev))
 		limit = dma_get_mask(dev);
 	if (limit && of_address_to_resource(np, 0, &res) == 0)
-		unreachable = (dma_addr_t)res.end > limit;
+		unreachable = (dma_addr_t)res.start > limit;
 
 	of_node_put(np);
 
@@ -15702,73 +14348,11 @@ static void histb_vdec_release_pool(void *data)
 	of_reserved_mem_device_release(data);
 }
 
-/* Keep this allocation context alive until the last exported capture surface
- * is released, even when the video device has already been removed.
- */
-static void histb_vdec_capture_dev_release(struct device *dev)
-{
-	of_reserved_mem_device_release(dev);
-	of_node_put(dev->of_node);
-	put_device(dev->parent);
-	kfree(dev);
-}
-
-static void histb_vdec_put_capture_dev(void *data)
-{
-	put_device(data);
-}
-
-static const struct histb_vdec_backend histb_vdec_cv200_backend = {
-	.caps = HISTB_VDEC_BACKEND_AVSP | HISTB_VDEC_BACKEND_VP8 |
-		HISTB_VDEC_BACKEND_VP9,
-	.formats = histb_vdec_cv200_formats,
-	.num_formats = ARRAY_SIZE(histb_vdec_cv200_formats),
-	.stream_guard = histb_vdec_cv200_stream_guard,
-	.surface_stride = histb_vdec_cv200_surface_stride,
-	.surface_height_align = histb_vdec_cv200_surface_height_align,
-	.pmv_size = histb_vdec_cv200_pmv_size,
-	.configure_clock = histb_vdec_cv200_configure_clock,
-	.reset_engine = histb_vdec_cv200_reset_engine,
-	.reset_vdh = histb_vdec_cv200_reset_vdh_domain,
-	.reset_bpd = histb_vdec_cv200_reset_bpd,
-	.completion_valid = histb_vdec_cv200_completion_valid,
-};
-
-static const struct histb_vdec_backend histb_vdec_mv310_backend = {
-	.caps = HISTB_VDEC_BACKEND_AVS2 | HISTB_VDEC_BACKEND_MPEG1 |
-		HISTB_VDEC_BACKEND_MVC,
-	.formats = histb_vdec_mv310_formats,
-	.num_formats = ARRAY_SIZE(histb_vdec_mv310_formats),
-	.stream_guard = histb_vdec_mv310_stream_guard,
-	.surface_tail_guard = 0x420,
-	.surface_stride = histb_vdec_mv310_surface_stride,
-	.surface_height_align = histb_vdec_mv310_surface_height_align,
-	.pmv_size = histb_vdec_mv310_pmv_size,
-	.configure_clock = histb_vdec_mv310_configure_clock,
-	.reset_engine = histb_vdec_mv310_reset,
-	.reset_vdh = histb_vdec_mv310_reset_vdh,
-	.reset_bpd = histb_vdec_mv310_reset_bpd,
-	.completion_valid = histb_vdec_mv310_completion_valid,
-	.start = histb_vdec_start_v5r6,
-	.encode_h264_picture = histb_v5r6_encode_h264_picture,
-	.encode_h264_slice = histb_v5r6_encode_h264_slice,
-	.encode_hevc_picture = histb_v5r6_encode_hevc_picture,
-	.encode_hevc_slice = histb_v5r6_encode_hevc_slice,
-	.encode_mpeg2_picture = histb_v5r6_encode_mpeg2_picture,
-	.encode_mpeg2_slice = histb_v5r6_encode_mpeg2_slice,
-	.encode_avs_picture = histb_v5r6_encode_avs_picture,
-	.encode_avs_slice = histb_v5r6_encode_avs_slice,
-};
-
 static int histb_vdec_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct histb_vdec_dev *vdec;
 	unsigned int num_resets;
-	struct device_node *np;
-	struct reserved_mem *rmem;
-	dma_addr_t limit;
-	int capture_index;
 	int ret;
 
 	vdec = devm_kzalloc(dev, sizeof(*vdec), GFP_KERNEL);
@@ -15776,84 +14360,56 @@ static int histb_vdec_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	vdec->dev = dev;
-	vdec->mv310 = of_device_is_compatible(dev->of_node,
-					    "hisilicon,hi3798mv310-vdec");
-	vdec->backend = vdec->mv310 ? &histb_vdec_mv310_backend :
-		&histb_vdec_cv200_backend;
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	/*
+	 * The decoder needs large physically contiguous allocations, which
+	 * fail from the shared CMA pool once the desktop has filled it with
+	 * movable pages.  Use the board's dedicated decoder pool when the
+	 * device tree provides one.
+	 */
+	/*
+	 * The device can only reach what its DMA aperture allows (measured:
+	 * bus_dma_limit 0x3fffffff for this node).  A memory-region that lies
+	 * outside it cannot be used for DMA at all, yet
+	 * of_reserved_mem_device_init() binds it unconditionally, and every
+	 * coherent allocation then comes from beyond the limit and fails.
+	 *
+	 * On this board that is exactly the case: vdec-pool@50000000 sits at
+	 * 1.25 GiB while the decoder is limited to 1 GiB, because the pool was
+	 * moved past the aperture on the reasoning that the Mali - which does
+	 * live outside soc - no longer needed the low window.  The pool belongs
+	 * to the decoder, which never left soc, so it cannot reach it.
+	 *
+	 * Refuse a pool the device cannot address and let the shared CMA serve
+	 * the allocations instead.  That is what makes hardware decode work
+	 * here: with the pool bound, every h264 frame is refused with -EINVAL
+	 * because the MSG buffer's dma_alloc_coherent() fails; without it,
+	 * decode is byte-identical to the software decoder.
+	 */
+	ret = histb_vdec_pool_unreachable(dev);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
-	if (histb_vdec_pool_unreachable(dev))
-		return dev_err_probe(dev, -ERANGE,
-				     "reconstruction pool exceeds DMA aperture\n");
-	ret = of_reserved_mem_device_init_by_name(dev, dev->of_node,
-						 "reconstruction");
-	if (ret)
-		return dev_err_probe(dev, ret, "missing reconstruction pool\n");
-	ret = devm_add_action_or_reset(dev, histb_vdec_release_pool, dev);
-	if (ret)
-		return ret;
-
-	capture_index = of_property_match_string(dev->of_node,
-						"memory-region-names", "capture");
-	if (capture_index < 0)
-		return dev_err_probe(dev, capture_index, "missing capture pool\n");
-	np = of_parse_phandle(dev->of_node, "memory-region", capture_index);
-	if (!np)
-		return dev_err_probe(dev, -ENODEV, "missing capture pool node\n");
-	rmem = of_reserved_mem_lookup(np);
-	if (!rmem || !rmem->priv ||
-	    !of_device_is_compatible(np, "shared-dma-pool") ||
-	    !of_property_read_bool(np, "reusable") ||
-	    of_property_read_bool(np, "no-map")) {
-		of_node_put(np);
-		return dev_err_probe(dev, -EINVAL, "capture pool is not CMA\n");
+		dev_warn(dev,
+			 "reserved decoder pool is outside the DMA aperture (limit 0x%llx); using CMA instead\n",
+			 (unsigned long long)dev->bus_dma_limit);
+	else {
+		ret = of_reserved_mem_device_init(dev);
+		if (ret && ret != -ENODEV)
+			return dev_err_probe(dev, ret,
+					     "failed to get the decoder memory pool\n");
+		if (!ret) {
+			ret = devm_add_action_or_reset(dev, histb_vdec_release_pool, dev);
+			if (ret)
+				return ret;
+		}
 	}
-	limit = min_not_zero(dev->bus_dma_limit, dma_get_mask(dev));
-	if (rmem->base > limit || rmem->size - 1 > limit - rmem->base) {
-		of_node_put(np);
-		return dev_err_probe(dev, -ERANGE, "capture pool exceeds DMA aperture\n");
-	}
-	of_node_put(np);
-	vdec->capture_dev = kzalloc(sizeof(*vdec->capture_dev), GFP_KERNEL);
-	if (!vdec->capture_dev)
-		return -ENOMEM;
-	device_initialize(vdec->capture_dev);
-	vdec->capture_dev->release = histb_vdec_capture_dev_release;
-	vdec->capture_dev->parent = get_device(dev);
-	vdec->capture_dev->of_node = of_node_get(dev->of_node);
-	vdec->capture_dev->coherent_dma_mask = DMA_BIT_MASK(32);
-	vdec->capture_dev->dma_mask = &vdec->capture_dev->coherent_dma_mask;
-	ret = dev_set_name(vdec->capture_dev, "%s-capture", dev_name(dev));
-	if (!ret)
-		ret = of_dma_configure(vdec->capture_dev, dev->of_node, true);
-	if (!ret)
-		ret = of_reserved_mem_device_init_by_name(vdec->capture_dev,
-							dev->of_node, "capture");
-	if (ret) {
-		put_device(vdec->capture_dev);
-		return dev_err_probe(dev, ret, "failed to bind capture CMA\n");
-	}
-	ret = devm_add_action_or_reset(dev, histb_vdec_put_capture_dev,
-				       vdec->capture_dev);
-	if (ret)
-		return ret;
-	dev_info(dev, "capture CMA: %llu MiB\n",
-		 (unsigned long long)rmem->size / SZ_1M);
 	vdec->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(vdec->regs))
 		return PTR_ERR(vdec->regs);
-	if (vdec->mv310)
-		vdec->crg = syscon_regmap_lookup_by_phandle(dev->of_node,
-							 "hisilicon,crg-syscon");
-	else
-		vdec->crg = syscon_regmap_lookup_by_compatible(
+	vdec->crg = syscon_regmap_lookup_by_compatible(
 					"hisilicon,hi3798cv200-crg");
 	if (IS_ERR(vdec->crg))
 		return dev_err_probe(dev, PTR_ERR(vdec->crg),
 				     "failed to get CRG syscon\n");
 
-	if (!vdec->mv310) {
 	vdec->clocks[0].id = "vdh";
 	vdec->clocks[1].id = "dsp";
 	vdec->clocks[2].id = "bpd";
@@ -15870,20 +14426,15 @@ static int histb_vdec_probe(struct platform_device *pdev)
 						    vdec->resets);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to get resets\n");
-	}
 
-	ret = devm_add_action_or_reset(dev, histb_media_smmu_release_identity,
-				       &vdec->smmu);
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
-		return ret;
+		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
 	vdec->vpss = histb_vpss_get(dev);
 	if (IS_ERR(vdec->vpss))
 		return dev_err_probe(dev, PTR_ERR(vdec->vpss),
 				     "failed to get VPSS\n");
 	ret = devm_add_action_or_reset(dev, histb_vdec_put_vpss, vdec->vpss);
-	if (ret)
-		return ret;
-	ret = devm_add_action_or_reset(dev, histb_vdec_release_avsp, vdec);
 	if (ret)
 		return ret;
 
@@ -15919,8 +14470,9 @@ static int histb_vdec_probe(struct platform_device *pdev)
 	if (ret)
 		goto disable_runtime_pm;
 
-	dev_info(dev, "registered as /dev/%s\n",
-		 video_device_node_name(&vdec->vfd));
+	dev_info(dev, "registered as /dev/%s (multi-planar: /dev/%s)\n",
+		 video_device_node_name(&vdec->vfd),
+		 video_device_node_name(&vdec->vfd_mp));
 	return 0;
 
 disable_runtime_pm:
@@ -15944,14 +14496,13 @@ static void histb_vdec_remove(struct platform_device *pdev)
 
 static const struct of_device_id histb_vdec_of_match[] = {
 	{ .compatible = "hisilicon,hi3798cv200-vdec" },
-	{ .compatible = "hisilicon,hi3798mv310-vdec" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_vdec_of_match);
 
 static struct platform_driver histb_vdec_driver = {
 	.probe = histb_vdec_probe,
-	.remove_new = histb_vdec_remove,
+	.remove = histb_vdec_remove,
 	.driver = {
 		.name = "histb-vdec",
 		.of_match_table = histb_vdec_of_match,
@@ -15960,10 +14511,13 @@ static struct platform_driver histb_vdec_driver = {
 };
 module_platform_driver(histb_vdec_driver);
 
-MODULE_DESCRIPTION("HiSilicon CV200/MV310 VDH video decoder");
+MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
+MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
+/* Build tag so a deployment can be proven to have taken effect. */
+#define HISTB_VDEC_BUILD_TAG "dvbip-20261003-display-order-dei"
+MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);
 MODULE_FIRMWARE(HISTB_VDEC_H264_CABAC_FIRMWARE);
 MODULE_FIRMWARE(HISTB_VDEC_HEVC_CABAC_FIRMWARE);
-MODULE_FIRMWARE(HISTB_VDEC_AVSP_FIRMWARE);
 MODULE_LICENSE("GPL");

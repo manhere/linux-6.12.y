@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * HiSilicon Hi3798CV200 / Hi3798MV310 video post-processing subsystem
+ * HiSilicon Hi3798CV200 video post-processing subsystem
  *
- * Each SoC uses its own BSP vpss_v4_0 register/channel implementation.
+ * Copyright (C) 2026 HiSilicon Technologies Co., Ltd.
  */
 
+#include <linux/bitfield.h>
 #include <linux/build_bug.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
@@ -15,6 +16,7 @@
 #include <linux/iopoll.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -24,13 +26,8 @@
 #include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
-#include <media/v4l2-device.h>
-#include <media/v4l2-ioctl.h>
-#include <media/v4l2-mem2mem.h>
-#include <media/videobuf2-dma-contig.h>
-#include <media/videobuf2-v4l2.h>
 
-#include "histb-media-smmu.h"
+#include "histb-dma.h"
 #include "histb-vpss.h"
 
 #define HISTB_VPSS_CTRL			0x000
@@ -63,10 +60,6 @@
 #define HISTB_VPSS_RGMVNX2_STRIDE	0x1d8
 #define HISTB_VPSS_BLKMV_NX1_ADDR	0x1dc
 #define HISTB_VPSS_BLKMVNX1_STRIDE	0x1e0
-#define HISTB_VPSS_RFR_CTRL		0x140
-#define HISTB_VPSS_RFR_Y_ADDR		0x144
-#define HISTB_VPSS_RFR_C_ADDR		0x148
-#define HISTB_VPSS_RFR_STRIDE		0x14c
 #define HISTB_VPSS_CTRL_MCDI_EN		BIT(8)
 #define HISTB_VPSS_CTRL_MEDS_EN		BIT(9)
 #define HISTB_VPSS_STT_W_ADDR		0x170
@@ -106,11 +99,6 @@
 #define HISTB_VPSS_ZME_CV_COEF_ADDR	0x20c
 #define HISTB_VPSS_RCH_BYPASS		0x280
 #define HISTB_VPSS_WCH_BYPASS		0x284
-#define HISTB_VPSS_SMMU_CTRL		0xf000
-#define HISTB_VPSS_SMMU_SCB_TTBR	0xf208
-#define HISTB_VPSS_SMMU_CB_TTBR		0xf20c
-#define HISTB_VPSS_SMMU_ERR_RD_ADDR	0xf304
-#define HISTB_VPSS_SMMU_ERR_WR_ADDR	0xf308
 /* De-interlacer field registers, in groups of four: control, Y, C, stride. */
 #define HISTB_VPSS_DEI_CUR_CTRL		0x100
 #define HISTB_VPSS_DEI_CURYADDR		0x104
@@ -146,6 +134,14 @@
 #define HISTB_VPSS_MACCFG		0x318
 #define HISTB_VPSS_FTCONFIG		0x320
 #define HISTB_VPSS_BUSCTRL		0x344
+/* VPSS-local SMMU block (hi_reg_vpss.h, 0xf000..). */
+#define HISTB_VPSS_SMMU_SCR		0xf000
+#define HISTB_VPSS_SMMU_INTRAW_S	0xf014
+#define HISTB_VPSS_SMMU_INTRAW_NS	0xf024
+#define HISTB_VPSS_SMMU_ERR_WRADDR_S	0xf2f4
+#define HISTB_VPSS_SMMU_ERR_WRADDR_NS	0xf308
+#define HISTB_VPSS_SMMU_FAULT_ADDR_WR_S	0xf330
+#define HISTB_VPSS_SMMU_FAULT_ADDR_WR_NS	0xf340
 
 /* VPSS_CTRL */
 #define HISTB_VPSS_CTRL_DEI_EN		BIT(7)
@@ -177,7 +173,6 @@
 #define HISTB_VPSS_RFR_C_ADDR		0x148
 #define HISTB_VPSS_RFR_STRIDE		0x14c
 #define HISTB_VPSS_CTRL_PROT		GENMASK(24, 23)	/* prot is 2 bits */
-#define HISTB_VPSS_CTRL_PROT_NONSECURE	BIT(24)
 #define HISTB_VPSS_CTRL_IMG_PRO_MODE	GENMASK(28, 27)
 #define HISTB_VPSS_CTRL_IGBM_EN		BIT(26)
 #define HISTB_VPSS_CTRL_BFIELD		BIT(31)
@@ -207,9 +202,7 @@
 #define HISTB_VPSS_ST_RD_ADDR		0x164
 #define HISTB_VPSS_ST_WR_ADDR		0x168
 #define HISTB_VPSS_ST_STRIDE		0x16c
-#define HISTB_VPSS_DEI_ST_SLOTS		6
-/* One CV200 statistics-writeback image (VPSS_STTWBC_SIZE in the BSP). */
-#define HISTB_VPSS_STT_W_SIZE		SZ_32K
+#define HISTB_VPSS_DEI_ST_SLOTS		3
 #define HISTB_VPSS_CTRL_TNR_EN		BIT(18)
 #define HISTB_VPSS_CTRL_SNR_EN		BIT(17)
 #define HISTB_VPSS_CTRL_RFR_EN		BIT(19)
@@ -278,7 +271,6 @@
 #define HISTB_VPSS_NODE_SIZE		SZ_64K
 #define HISTB_VPSS_ZME_COEF_SIZE		SZ_4K
 #define HISTB_VPSS_ZME_COEF_SLOT_SIZE	0x100
-#define HISTB_VPSS_TOTAL_NODE_SIZE		(HISTB_VPSS_NODE_SIZE + HISTB_VPSS_ZME_COEF_SIZE)
 #define HISTB_VPSS_ZME_HL_UP_OFFSET	0x000
 #define HISTB_VPSS_ZME_HL_EXACT_OFFSET	0x100
 #define HISTB_VPSS_ZME_HL_MID_OFFSET	0x200
@@ -292,60 +284,52 @@
 #define HISTB_VPSS_JOB_TIMEOUT_MS	1000
 #define HISTB_VPSS_CORE_RATE		400000000UL
 
-/* MV310: active common/drv/include/hi3798mv310/hi_reg_vpss.h. */
-#define MV310_VPSS_NODE_ID		0x2f8
-#define MV310_VPSS_INT_MASK		0x324
-#define MV310_VPSS_MST_OUTSTANDING	0x400
-#define MV310_VPSS_MST_CTRL		0x404
-#define MV310_VPSS_CHN_CFG		0x5000
-#define MV310_VPSS_STT_ADDR		0x5010
-#define MV310_VPSS_CF_CTRL		0x5080
-#define MV310_VPSS_CF_SIZE		0x5088
-#define MV310_VPSS_CF_Y			0x5094
-#define MV310_VPSS_CF_C			0x509c
-#define MV310_VPSS_CF_STRIDE		0x50c8
-#define MV310_VPSS_CF_LOW_Y		0x50d4
-#define MV310_VPSS_CF_LOW_C		0x50dc
-#define MV310_VPSS_CF_LOW_STRIDE		0x50e0
-#define MV310_VPSS_OUT_CTRL		0x5800
-#define MV310_VPSS_OUT_Y			0x580c
-#define MV310_VPSS_OUT_C			0x5814
-#define MV310_VPSS_OUT_STRIDE		0x5818
-#define MV310_VPSS_OUT_SIZE		0x5830
-#define MV310_VPSS_INT_ALL		GENMASK(6, 0)
-#define MV310_VPSS_INT_ERROR		(BIT(1) | BIT(2) | BIT(5) | BIT(6))
-#define MV310_VPSS_IRQ_ENABLE		(BIT(3) | MV310_VPSS_INT_ERROR)
+/*
+ * VPSS_CTRL.prot[24:23] is the AXI protection attribute of every VPSS
+ * master transaction.  The BSP's VPSS_REG_SetProtEn() writes 0x0 for a
+ * SECURE job and 0x2 for a normal one (vpss_reg_3798cv200.c:518) - bit 1 is
+ * AxPROT[1], "non-secure".  This driver used to leave it 0 with the comment
+ * "not secure", i.e. it issued secure transactions.  On a box whose TEE has
+ * programmed the DDR firewall for the secure video path, secure media
+ * masters may read normal memory but may not write it, which is exactly
+ * RAWINT 0x8d: eof | bus_w_err | eof_end | ip_used, and no bus_r_err.
+ */
+#define HISTB_VPSS_PROT_NONSECURE	2
+static unsigned int prot = HISTB_VPSS_PROT_NONSECURE;
+module_param(prot, uint, 0644);
+MODULE_PARM_DESC(prot,
+		 "VPSS_CTRL.prot: 2 = non-secure (BSP default, fix), 0 = secure (pre-fix A/B)");
+
+/*
+ * Write post-processed frames into the VPSS's own staging buffer and copy
+ * them to the capture buffer with the CPU, instead of letting the VPSS write
+ * the capture buffer directly.  A/B for "is the destination address the
+ * problem" (e.g. a capture buffer inside a firewalled top-of-DDR window).
+ */
+static bool force_staging;
+module_param(force_staging, bool, 0644);
+MODULE_PARM_DESC(force_staging,
+		 "1 = VPSS writes its own staging buffer, CPU copies to the capture buffer");
+
+/*
+ * VPSS_STT_W_ADDR: the statistics write-back block.  Every BSP node builder
+ * points it at a 32 KiB buffer (VPSS_STTWBC_SIZE, vpss_sttinf.h:124) - this
+ * driver wrote 0, i.e. physical address 0, which on this ARM32 kernel is the
+ * page below swapper_pg_dir (phys 0x4000).
+ */
+#define HISTB_VPSS_STT_SIZE		SZ_32K
 
 static_assert(HISTB_VPSS_ZME_HL8_BYTES <= HISTB_VPSS_ZME_COEF_SLOT_SIZE);
 static_assert(HISTB_VPSS_ZME_4T_BYTES <= HISTB_VPSS_ZME_COEF_SLOT_SIZE);
 static_assert(HISTB_VPSS_ZME_4T_LOW_OFFSET +
 	      HISTB_VPSS_ZME_COEF_SLOT_SIZE <= HISTB_VPSS_ZME_COEF_SIZE);
 
-struct histb_vpss;
-struct histb_vpss_backend {
-	bool mv310;
-	u32 int_mask_reg;
-	u32 int_done;
-	u32 int_error;
-	u32 int_all;
-	u32 irq_enable;
-	unsigned long dma_bits;
-	bool (*dma_valid)(struct histb_vpss *vpss, dma_addr_t dma, size_t size);
-	void (*init)(struct histb_vpss *vpss);
-	void (*load_coefficients)(struct histb_vpss *vpss);
-	int (*detile)(struct histb_vpss *vpss,
-			     const struct histb_vpss_frame *frame);
-};
-
 struct histb_vpss {
-	const struct histb_vpss_backend *backend;
 	struct device *dev;
 	void __iomem *regs;
 	struct clk *clock;
 	struct reset_control *reset;
 	int irq;
-	bool mv310;
-	dma_addr_t stt_dma;
 
 	phys_addr_t regs_phys;
 	__le32 *node;
@@ -357,98 +341,20 @@ struct histb_vpss {
 	size_t staging_size;
 
 	/* Motion-statistics ring the de-interlacer reads from and writes to. */
+	/* Statistics write-back (STT_W_ADDR), always written by the engine. */
+	void *stt_cpu;
+	dma_addr_t stt_dma;
+
 	void *dei_st_cpu;
 	dma_addr_t dei_st_dma;
 	size_t dei_st_size;
 	u32 dei_st_seq;
-	void *rfr_cpu;
-	dma_addr_t rfr_dma;
-	size_t rfr_size;
 
-	struct histb_media_smmu smmu;
+	/* Serializes the single hardware pipeline and its staging buffer. */
 	struct mutex lock;
 	struct completion completion;
 	u32 irq_state;
-	bool clock_enabled;
-	bool engine_faulted;
-	struct v4l2_device v4l2_dev;
-	struct v4l2_m2m_dev *m2m_dev;
-	struct video_device vfd;
-	struct mutex dev_mutex;
 };
-
-static void histb_vpss_node_write(struct histb_vpss *vpss, u32 reg,
-					  u32 value);
-
-static u32 histb_vpss_int_mask_reg(const struct histb_vpss *vpss)
-{
-	return vpss->backend->int_mask_reg;
-}
-
-static bool histb_vpss_cv200_dma_valid(struct histb_vpss *vpss,
-				       dma_addr_t dma, size_t size)
-{
-	return histb_media_smmu_dma_range_valid(dma, size);
-}
-
-static bool histb_vpss_mv310_dma_valid(struct histb_vpss *vpss,
-				       dma_addr_t dma, size_t size)
-{
-	return size && dma <= U32_MAX && size - 1 <= U32_MAX - dma;
-}
-
-static bool histb_vpss_dma_valid(struct histb_vpss *vpss,
-			       dma_addr_t dma, size_t size)
-{
-	return vpss->backend->dma_valid(vpss, dma, size);
-}
-
-static void histb_vpss_mv310_init(struct histb_vpss *vpss)
-{
-	/* BSP SetMacCfg: read=15, write=7, arb=1, MID=1, split=256.
-	 * cas_mmu_bypass also makes the linked-list fetch use physical DMA.
-	 */
-	writel(0x7f, vpss->regs + MV310_VPSS_MST_OUTSTANDING);
-	writel(BIT(10) | BIT(8) | BIT(4) | 1,
-	       vpss->regs + MV310_VPSS_MST_CTRL);
-	writel(BIT(0), vpss->regs + HISTB_VPSS_SMMU_CTRL);
-	writel(U32_MAX, vpss->regs + HISTB_VPSS_TIMEOUT);
-	writel(vpss->backend->irq_enable,
-	       vpss->regs + MV310_VPSS_INT_MASK);
-	writel(vpss->backend->int_all, vpss->regs + HISTB_VPSS_INT_CLEAR);
-}
-
-static void histb_vpss_program_smmu(struct histb_vpss *vpss, bool enable)
-{
-	if (vpss->backend->mv310) {
-		writel(BIT(0), vpss->regs + HISTB_VPSS_SMMU_CTRL);
-		return;
-	}
-
-	if (!enable || !histb_media_smmu_ready(&vpss->smmu)) {
-		writel(BIT(0), vpss->regs + HISTB_VPSS_SMMU_CTRL);
-		return;
-	}
-
-	writel(lower_32_bits(histb_media_smmu_pt_dma(&vpss->smmu)),
-	       vpss->regs + HISTB_VPSS_SMMU_SCB_TTBR);
-	writel(lower_32_bits(histb_media_smmu_pt_dma(&vpss->smmu)),
-	       vpss->regs + HISTB_VPSS_SMMU_CB_TTBR);
-	writel(lower_32_bits(histb_media_smmu_err_rd_dma(&vpss->smmu)),
-	       vpss->regs + HISTB_VPSS_SMMU_ERR_RD_ADDR);
-	writel(lower_32_bits(histb_media_smmu_err_wr_dma(&vpss->smmu)),
-	       vpss->regs + HISTB_VPSS_SMMU_ERR_WR_ADDR);
-	wmb();
-	writel(BIT(3), vpss->regs + HISTB_VPSS_SMMU_CTRL);
-}
-
-static void histb_vpss_program_node_smmu(struct histb_vpss *vpss)
-{
-	u32 bypass = histb_media_smmu_ready(&vpss->smmu) ? 0 : U32_MAX;
-
-	histb_vpss_node_write(vpss, HISTB_VPSS_RCH_BYPASS, bypass);
-	histb_vpss_node_write(vpss, HISTB_VPSS_WCH_BYPASS, bypass);
-}
 
 /* CV200 VPSS FIR tables: 17 stored phases; hardware mirrors the other 15. */
 static const s16 histb_vpss_zme_hl8_up[17][8] = {
@@ -615,6 +521,92 @@ static void histb_vpss_node_write(struct histb_vpss *vpss, u32 reg,
 	vpss->node[reg / sizeof(*vpss->node)] = cpu_to_le32(value);
 }
 
+/* VPSS_RAWINT / VPSS_INTSTATE bit names, hi_reg_vpss.h U_VPSS_RAWINT. */
+static const char *const histb_vpss_int_names[] = {
+	"eof", "timeout", "bus_w_err", "eof_end", "vhd0_tunl",
+	"dcmp_err", "bus_r_err", "ip_used", "ip_using_err",
+};
+
+static void histb_vpss_int_decode(u32 state, char *buf, size_t len)
+{
+	unsigned int i;
+	size_t pos = 0;
+
+	buf[0] = '\0';
+	for (i = 0; i < ARRAY_SIZE(histb_vpss_int_names) && pos < len; i++)
+		if (state & BIT(i))
+			pos += scnprintf(buf + pos, len - pos, "%s%s",
+					 pos ? "|" : "",
+					 histb_vpss_int_names[i]);
+	if (!pos)
+		scnprintf(buf, len, "none");
+}
+
+/*
+ * One self-explanatory report for a failed detile job: the interrupt bits
+ * by name, what the node asked for (addresses, strides, sizes, CTRL.prot),
+ * what the engine latched, the core clock, and the VPSS SMMU fault words.
+ */
+static void histb_vpss_report_failure(struct histb_vpss *vpss,
+				      const struct histb_vpss_frame *frame,
+				      u32 state, dma_addr_t output_dma,
+				      u32 output_stride, bool direct_output)
+{
+	u32 ctrl = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL);
+	char names[96];
+
+	histb_vpss_int_decode(state, names, sizeof(names));
+	dev_err(vpss->dev,
+		"post-processing failed, state=%#x [%s]%s%s\n", state, names,
+		(state & HISTB_VPSS_INT_BUS_WRITE) ?
+			" - a WRITE was rejected by the bus (firewall/secure attribute/address)" : "",
+		(state & HISTB_VPSS_INT_BUS_READ) ?
+			" - a READ was rejected by the bus" : "");
+	dev_err(vpss->dev,
+		"vpss job: node ctrl=%#010x prot=%lu (2=non-secure) in %ux%u stride=%u align=%u y=%pad size=%zu -> out %ux%u stride=%u y=%#llx c=%#llx %s stt=%pad clk=%lu Hz\n",
+		ctrl, FIELD_GET(HISTB_VPSS_CTRL_PROT, ctrl),
+		frame->input_width ?: frame->width,
+		frame->input_height ?: frame->height,
+		frame->input_stride, frame->input_height_align,
+		&frame->input_dma, frame->input_size,
+		frame->width, frame->height, output_stride,
+		(u64)output_dma, (u64)output_dma + (u64)output_stride * frame->height,
+		direct_output ? "(capture buffer)" : "(staging)",
+		&vpss->stt_dma, clk_get_rate(vpss->clock));
+	dev_err(vpss->dev,
+		"vpss live: ctrl=%#x ctrl2=%#x ctrl3=%#x imgsize=%#x in(ctrl=%#x y=%#x c=%#x stride=%#x) out(ctrl=%#x size=%#x y=%#x c=%#x stride=%#x) stt_w=%#x rch_bp=%#x wch_bp=%#x rawint=%#x eofcnt=%u misc=%#x pnext=%#x\n",
+		readl(vpss->regs + HISTB_VPSS_CTRL),
+		readl(vpss->regs + HISTB_VPSS_CTRL2),
+		readl(vpss->regs + HISTB_VPSS_CTRL3),
+		readl(vpss->regs + HISTB_VPSS_IMG_SIZE),
+		readl(vpss->regs + HISTB_VPSS_INPUT_CTRL),
+		readl(vpss->regs + HISTB_VPSS_INPUT_Y_ADDR),
+		readl(vpss->regs + HISTB_VPSS_INPUT_C_ADDR),
+		readl(vpss->regs + HISTB_VPSS_INPUT_STRIDE),
+		readl(vpss->regs + HISTB_VPSS_OUTPUT_CTRL),
+		readl(vpss->regs + HISTB_VPSS_OUTPUT_SIZE),
+		readl(vpss->regs + HISTB_VPSS_OUTPUT_Y_ADDR),
+		readl(vpss->regs + HISTB_VPSS_OUTPUT_C_ADDR),
+		readl(vpss->regs + HISTB_VPSS_OUTPUT_STRIDE),
+		readl(vpss->regs + HISTB_VPSS_STT_W_ADDR),
+		readl(vpss->regs + HISTB_VPSS_RCH_BYPASS),
+		readl(vpss->regs + HISTB_VPSS_WCH_BYPASS),
+		readl(vpss->regs + HISTB_VPSS_RAW_INT),
+		readl(vpss->regs + HISTB_VPSS_EOF_CNT),
+		readl(vpss->regs + HISTB_VPSS_MISC),
+		readl(vpss->regs + HISTB_VPSS_NEXT));
+	/* VPSS-local SMMU, hi_reg_vpss.h 0xf000..: bypassed per channel. */
+	dev_err(vpss->dev,
+		"vpss smmu: scr=%#x intraw_s=%#x intraw_ns=%#x err_wr_s=%#x err_wr_ns=%#x fault_wr_s=%#x fault_wr_ns=%#x\n",
+		readl(vpss->regs + HISTB_VPSS_SMMU_SCR),
+		readl(vpss->regs + HISTB_VPSS_SMMU_INTRAW_S),
+		readl(vpss->regs + HISTB_VPSS_SMMU_INTRAW_NS),
+		readl(vpss->regs + HISTB_VPSS_SMMU_ERR_WRADDR_S),
+		readl(vpss->regs + HISTB_VPSS_SMMU_ERR_WRADDR_NS),
+		readl(vpss->regs + HISTB_VPSS_SMMU_FAULT_ADDR_WR_S),
+		readl(vpss->regs + HISTB_VPSS_SMMU_FAULT_ADDR_WR_NS));
+}
+
 static u32 histb_vpss_pack_10bit(s16 c0, s16 c1, s16 c2)
 {
 	return ((u16)c0 & GENMASK(9, 0)) |
@@ -710,18 +702,18 @@ static u32 histb_vpss_zme_4t_offset(u32 input, u32 output)
  * at the top of every bottom-field result.  Program the vendor copy path and
  * the full-frame crop/LBA window.
  */
-static void histb_vpss_config_dei_port(struct histb_vpss *vpss, u32 in_width,
-				       u32 in_height, u32 out_width, u32 out_height)
+static void histb_vpss_config_dei_port(struct histb_vpss *vpss, u32 width,
+				       u32 height)
 {
-	u32 hratio = div_u64((u64)in_width * HISTB_VPSS_ZME_H_RATIO_PRECISION, out_width);
-	u32 vratio = div_u64((u64)in_height * HISTB_VPSS_ZME_V_RATIO_PRECISION, out_height);
-	u32 hl_offset = histb_vpss_zme_hl8_offset(in_width, out_width);
-	u32 vc_offset = histb_vpss_zme_4t_offset(in_height, out_height);
-	u32 hc_offset = histb_vpss_zme_4t_offset(in_width, out_width);
+	u32 hratio = HISTB_VPSS_ZME_H_RATIO_PRECISION;
+	u32 vratio = HISTB_VPSS_ZME_V_RATIO_PRECISION;
+	u32 hl_offset = histb_vpss_zme_hl8_offset(width, width);
+	u32 vc_offset = histb_vpss_zme_4t_offset(height, height);
+	u32 hc_offset = histb_vpss_zme_4t_offset(width, width);
 	u32 ctrl3 = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL3);
 
 	histb_vpss_node_write(vpss, HISTB_VPSS_ZME_OUTPUT_SIZE,
-			      (out_height - 1) << 16 | (out_width - 1));
+			      (height - 1) << 16 | (width - 1));
 	histb_vpss_node_write(vpss, HISTB_VPSS_ZME_ADDR,
 			      lower_32_bits(vpss->node_dma + HISTB_VPSS_ZME_HSP));
 	histb_vpss_node_write(vpss, HISTB_VPSS_ZME_LH_COEF_ADDR,
@@ -747,9 +739,9 @@ static void histb_vpss_config_dei_port(struct histb_vpss *vpss, u32 in_width,
 
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0CROP_POS, 0);
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0CROP_SIZE,
-			      (in_height - 1) << 16 | (in_width - 1));
+			      (height - 1) << 16 | (width - 1));
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0LBA_DSIZE,
-			      (out_height - 1) << 16 | (out_width - 1));
+			      (height - 1) << 16 | (width - 1));
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0LBA_VFPOS, 0);
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0LBA_BK, 0x02080200);
 	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL3,
@@ -758,32 +750,34 @@ static void histb_vpss_config_dei_port(struct histb_vpss *vpss, u32 in_width,
 			      HISTB_VPSS_CTRL3_VHD0_LBA_EN);
 }
 
-/* PERI_CRG60.vpss_srst_req also resets the VPSS DMA engines. */
+/*
+ * Assert and release the block's hardware reset - the same pulse
+ * VPSS_HAL_SetClockEn(TRUE) performs through PERI_CRG60.vpss_srst_req before
+ * every BSP job, so every BSP node is programmed into logic that has just
+ * come out of reset.  Pulsing it before a de-interlace job does not make the
+ * de-interlacer start: measured with the pulse on every DEI submission, the
+ * engine still took the node and diesta stayed 0, so the block does not need
+ * a reset release to be able to run.
+ */
 static int histb_vpss_reset(struct histb_vpss *vpss)
 {
 	int ret;
 
 	disable_irq(vpss->irq);
-	writel(0, vpss->regs + histb_vpss_int_mask_reg(vpss));
-	writel(vpss->backend->int_all,
-	       vpss->regs + HISTB_VPSS_INT_CLEAR);
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_MASK);
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	ret = reset_control_assert(vpss->reset);
 	if (ret)
-		goto stop_clock;
+		goto enable_irq;
 	udelay(1);
 	ret = reset_control_deassert(vpss->reset);
 	if (ret)
-		goto stop_clock;
+		goto enable_irq;
 	udelay(1);
-	vpss->backend->init(vpss);
-	goto enable_irq;
-
-stop_clock:
-	/* Do not let a failed reset leave DMA running on returned surfaces. */
-	clk_disable_unprepare(vpss->clock);
-	vpss->clock_enabled = false;
-	vpss->engine_faulted = true;
-	return ret;
+	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
+	writel(U32_MAX, vpss->regs + HISTB_VPSS_TIMEOUT);
+	writel(0xfe, vpss->regs + HISTB_VPSS_INT_MASK);
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 
 enable_irq:
 	enable_irq(vpss->irq);
@@ -795,14 +789,13 @@ static irqreturn_t histb_vpss_irq(int irq, void *data)
 	struct histb_vpss *vpss = data;
 	u32 state;
 
-	state = readl(vpss->regs + HISTB_VPSS_INT_STATE) &
-		vpss->backend->int_all;
+	state = readl(vpss->regs + HISTB_VPSS_INT_STATE) & HISTB_VPSS_INT_ALL;
 	if (!state)
 		return IRQ_NONE;
 
 	writel(state, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	vpss->irq_state |= state;
-	if (state & (vpss->backend->int_done | vpss->backend->int_error))
+	if (state & (HISTB_VPSS_INT_DONE | HISTB_VPSS_INT_ERROR))
 		complete(&vpss->completion);
 
 	return IRQ_HANDLED;
@@ -814,20 +807,6 @@ static size_t histb_vpss_output_stride(const struct histb_vpss_frame *frame)
 		return ALIGN(DIV_ROUND_UP((size_t)frame->width * 10, 8), 64);
 
 	return ALIGN(frame->width, 64);
-}
-
-static int histb_vpss_output_size(const struct histb_vpss_frame *frame,
-				 size_t *size)
-{
-	size_t rows = frame->height;
-
-	if (!frame->output_packed_yuv &&
-	    check_add_overflow(rows, (size_t)frame->height / 2, &rows))
-		return -EOVERFLOW;
-	if (check_mul_overflow((size_t)frame->output_stride, rows, size))
-		return -EOVERFLOW;
-
-	return 0;
 }
 
 /*
@@ -885,10 +864,10 @@ static int histb_vpss_prepare_staging(struct histb_vpss *vpss,
 		return 0;
 
 	if (vpss->staging_cpu)
-		dma_free_noncoherent(vpss->dev, vpss->staging_size,
+		histb_dma_free_noncoherent(vpss->dev, vpss->staging_size,
 				     vpss->staging_cpu, vpss->staging_dma,
 				     DMA_FROM_DEVICE);
-	vpss->staging_cpu = dma_alloc_noncoherent(vpss->dev, size,
+	vpss->staging_cpu = histb_dma_alloc_noncoherent(vpss->dev, size,
 						  &vpss->staging_dma,
 						     DMA_FROM_DEVICE, GFP_KERNEL);
 	if (!vpss->staging_cpu) {
@@ -896,8 +875,8 @@ static int histb_vpss_prepare_staging(struct histb_vpss *vpss,
 		return -ENOMEM;
 	}
 	vpss->staging_size = size;
-	if (!histb_vpss_dma_valid(vpss, vpss->staging_dma, size)) {
-		dma_free_noncoherent(vpss->dev, vpss->staging_size,
+	if (upper_32_bits(vpss->staging_dma)) {
+		histb_dma_free_noncoherent(vpss->dev, vpss->staging_size,
 				     vpss->staging_cpu, vpss->staging_dma,
 				     DMA_FROM_DEVICE);
 		vpss->staging_cpu = NULL;
@@ -916,8 +895,12 @@ static int histb_vpss_prepare_staging(struct histb_vpss *vpss,
  * times half the woven frame height, and rotates three of them
  * (vpss_sttinf.c: VPSS_STTINFO_CalDieBufSize / VPSS_STTINFO_DieInit).
  *
- * The BSP halves the woven-frame height, leaving stride * field_height
- * bytes per motion-statistics slot.
+ * The BSP is called with the woven frame height and halves it there, so the
+ * block holds one line of statistics per *field* line plus the chroma half
+ * again: stride * field_height.  Sizing it at stride * (field_height / 2),
+ * which is what this driver did, makes every block a third of the size the
+ * block actually writes and pushes the third write past the end of the
+ * allocation.
  */
 static u32 histb_vpss_dei_st_stride(u32 width)
 {
@@ -928,7 +911,7 @@ static int histb_vpss_prepare_dei_st(struct histb_vpss *vpss, u32 width,
 				     u32 field_height)
 {
 	size_t slot = (size_t)histb_vpss_dei_st_stride(width) * field_height;
-	size_t size = slot * HISTB_VPSS_DEI_ST_SLOTS + HISTB_VPSS_STT_W_SIZE;
+	size_t size = slot * HISTB_VPSS_DEI_ST_SLOTS;
 
 	if (!slot)
 		return -EINVAL;
@@ -947,7 +930,7 @@ static int histb_vpss_prepare_dei_st(struct histb_vpss *vpss, u32 width,
 	vpss->dei_st_size = size;
 	vpss->dei_st_seq = 0;
 	memset(vpss->dei_st_cpu, 0, size);
-	if (!histb_media_smmu_dma_range_valid(vpss->dei_st_dma, size)) {
+	if (upper_32_bits(vpss->dei_st_dma)) {
 		dma_free_coherent(vpss->dev, size, vpss->dei_st_cpu,
 				  vpss->dei_st_dma);
 		vpss->dei_st_cpu = NULL;
@@ -957,29 +940,6 @@ static int histb_vpss_prepare_dei_st(struct histb_vpss *vpss, u32 width,
 
 	return 0;
 }
-static int histb_vpss_ensure_rfr(struct histb_vpss *vpss, u32 width, u32 height)
-{
-	size_t size = ALIGN(width, 16) * ALIGN(height, 16) * 3 / 2;
-
-	if (vpss->rfr_cpu && vpss->rfr_size >= size)
-		return 0;
-
-	if (vpss->rfr_cpu) {
-		dma_free_coherent(vpss->dev, vpss->rfr_size,
-				  vpss->rfr_cpu, vpss->rfr_dma);
-		vpss->rfr_cpu = NULL;
-		vpss->rfr_size = 0;
-	}
-
-	vpss->rfr_cpu = dma_alloc_coherent(vpss->dev, size, &vpss->rfr_dma, GFP_KERNEL);
-	if (!vpss->rfr_cpu)
-		return -ENOMEM;
-
-	vpss->rfr_size = size;
-	memset(vpss->rfr_cpu, 0, size);
-	return 0;
-}
-
 
 static __le64 histb_vpss_unpack_group(const u8 *src)
 {
@@ -1049,483 +1009,6 @@ static void histb_vpss_copy_nv12(struct histb_vpss *vpss,
 	}
 }
 
-/* MV310 PQ HAL: LH6/LV4/CH4/CV4, unity = 64; first 17 mirrored phases.
- * pq_mng_zme_coef.h:g_pVZmeReduceVpssCoef, not the CV200 FIR tables.
- */
-static const s16 histb_vpss_mv310_hcoef[6][17][6] = {
-	{
-		{ -4, 7, 56, 7, -4, 2 },
-		{ -4, 6, 56, 9, -5, 2 },
-		{ -3, 4, 55, 11, -5, 2 },
-		{ -3, 3, 55, 13, -6, 2 },
-		{ -2, 1, 55, 14, -6, 2 },
-		{ -2, 0, 54, 16, -6, 2 },
-		{ -1, -1, 53, 18, -7, 2 },
-		{ -1, -2, 52, 20, -7, 2 },
-		{ -1, -3, 51, 22, -7, 2 },
-		{ 0, -4, 50, 24, -8, 2 },
-		{ 0, -5, 49, 26, -8, 2 },
-		{ 0, -6, 48, 28, -8, 2 },
-		{ 1, -6, 45, 30, -8, 2 },
-		{ 1, -7, 44, 32, -8, 2 },
-		{ 1, -7, 42, 34, -8, 2 },
-		{ 1, -8, 41, 36, -8, 2 },
-		{ 2, -8, 38, 38, -8, 2 },
-	},
-	{
-		{ 0, 0, 63, 1, 0, 0 },
-		{ 0, -2, 63, 3, 0, 0 },
-		{ 1, -3, 63, 4, -1, 0 },
-		{ 1, -4, 62, 6, -1, 0 },
-		{ 1, -5, 62, 8, -2, 0 },
-		{ 1, -6, 61, 10, -2, 0 },
-		{ 2, -7, 60, 12, -3, 0 },
-		{ 2, -7, 58, 15, -4, 0 },
-		{ 2, -8, 56, 17, -4, 1 },
-		{ 2, -8, 54, 20, -5, 1 },
-		{ 2, -8, 52, 22, -5, 1 },
-		{ 2, -9, 51, 25, -6, 1 },
-		{ 2, -9, 48, 28, -6, 1 },
-		{ 2, -9, 47, 30, -7, 1 },
-		{ 2, -8, 43, 33, -7, 1 },
-		{ 2, -8, 41, 36, -8, 1 },
-		{ 2, -8, 38, 38, -8, 2 },
-	},
-	{
-		{ -4, 9, 53, 9, -4, 1 },
-		{ -4, 8, 52, 11, -4, 1 },
-		{ -4, 7, 52, 13, -5, 1 },
-		{ -3, 5, 52, 14, -5, 1 },
-		{ -3, 4, 51, 16, -5, 1 },
-		{ -3, 3, 51, 18, -6, 1 },
-		{ -2, 2, 49, 20, -6, 1 },
-		{ -2, 1, 49, 21, -6, 1 },
-		{ -2, 0, 48, 23, -6, 1 },
-		{ -1, -1, 46, 25, -6, 1 },
-		{ -1, -2, 45, 27, -6, 1 },
-		{ -1, -3, 45, 28, -6, 1 },
-		{ -1, -3, 43, 30, -6, 1 },
-		{ 0, -4, 41, 32, -6, 1 },
-		{ 0, -4, 39, 34, -6, 1 },
-		{ 0, -4, 38, 36, -6, 0 },
-		{ 0, -5, 37, 37, -5, 0 },
-	},
-	{
-		{ -4, 13, 46, 13, -4, 0 },
-		{ -4, 12, 46, 14, -4, 0 },
-		{ -4, 11, 45, 16, -4, 0 },
-		{ -3, 9, 45, 17, -4, 0 },
-		{ -3, 8, 45, 18, -4, 0 },
-		{ -3, 7, 44, 20, -4, 0 },
-		{ -3, 6, 44, 21, -4, 0 },
-		{ -3, 5, 44, 22, -4, 0 },
-		{ -3, 4, 43, 24, -4, 0 },
-		{ -2, 3, 42, 25, -4, 0 },
-		{ -2, 2, 41, 27, -4, 0 },
-		{ -2, 2, 39, 28, -3, 0 },
-		{ -2, 1, 39, 29, -3, 0 },
-		{ -2, 0, 39, 31, -3, -1 },
-		{ -1, 0, 36, 32, -2, -1 },
-		{ -1, -1, 36, 33, -2, -1 },
-		{ -1, -2, 35, 35, -2, -1 },
-	},
-	{
-		{ -2, 15, 39, 15, -2, -1 },
-		{ -3, 15, 38, 17, -2, -1 },
-		{ -3, 14, 38, 18, -2, -1 },
-		{ -3, 13, 38, 19, -2, -1 },
-		{ -3, 13, 37, 20, -2, -1 },
-		{ -3, 12, 36, 21, -1, -1 },
-		{ -3, 11, 36, 22, -1, -1 },
-		{ -3, 10, 36, 23, -1, -1 },
-		{ -3, 9, 36, 24, -1, -1 },
-		{ -3, 8, 36, 25, 0, -2 },
-		{ -3, 8, 35, 26, 0, -2 },
-		{ -3, 7, 34, 27, 1, -2 },
-		{ -3, 6, 34, 28, 1, -2 },
-		{ -3, 5, 33, 29, 2, -2 },
-		{ -3, 5, 33, 29, 2, -2 },
-		{ -2, 4, 31, 30, 3, -2 },
-		{ -2, 3, 31, 31, 3, -2 },
-	},
-	{
-		{ -1, 17, 33, 17, -1, -1 },
-		{ -1, 16, 33, 17, 0, -1 },
-		{ -1, 15, 33, 18, 0, -1 },
-		{ -1, 15, 32, 19, 0, -1 },
-		{ -1, 14, 32, 19, 1, -1 },
-		{ -2, 13, 32, 21, 1, -1 },
-		{ -2, 13, 32, 22, 1, -2 },
-		{ -2, 12, 32, 22, 2, -2 },
-		{ -2, 11, 32, 23, 2, -2 },
-		{ -2, 11, 31, 24, 2, -2 },
-		{ -2, 10, 31, 24, 3, -2 },
-		{ -2, 9, 31, 25, 3, -2 },
-		{ -2, 8, 30, 26, 4, -2 },
-		{ -2, 8, 30, 26, 4, -2 },
-		{ -2, 7, 29, 27, 5, -2 },
-		{ -2, 7, 28, 28, 5, -2 },
-		{ -2, 6, 28, 28, 6, -2 },
-	},
-};
-
-static const s16 histb_vpss_mv310_vcoef[3][17][4] = {
-	{
-		{ 0, 63, 1, 0 },
-		{ -2, 63, 3, 0 },
-		{ -4, 63, 5, 0 },
-		{ -6, 63, 8, -1 },
-		{ -8, 62, 11, -1 },
-		{ -9, 62, 13, -2 },
-		{ -10, 60, 16, -2 },
-		{ -11, 59, 19, -3 },
-		{ -12, 58, 22, -4 },
-		{ -12, 57, 24, -5 },
-		{ -12, 55, 27, -6 },
-		{ -12, 52, 30, -6 },
-		{ -12, 51, 32, -7 },
-		{ -12, 49, 35, -8 },
-		{ -12, 47, 38, -9 },
-		{ -11, 45, 40, -10 },
-		{ -10, 42, 42, -10 },
-	},
-	{
-		{ 12, 44, 12, -4 },
-		{ 11, 44, 13, -4 },
-		{ 10, 44, 15, -5 },
-		{ 9, 44, 16, -5 },
-		{ 8, 43, 18, -5 },
-		{ 7, 43, 19, -5 },
-		{ 6, 42, 21, -5 },
-		{ 5, 42, 22, -5 },
-		{ 4, 41, 23, -4 },
-		{ 3, 40, 25, -4 },
-		{ 2, 40, 26, -4 },
-		{ 1, 39, 28, -4 },
-		{ 0, 39, 29, -4 },
-		{ 0, 37, 30, -3 },
-		{ -1, 36, 32, -3 },
-		{ -1, 34, 33, -2 },
-		{ -2, 34, 34, -2 },
-	},
-	{
-		{ 15, 36, 15, -2 },
-		{ 14, 36, 16, -2 },
-		{ 13, 36, 17, -2 },
-		{ 12, 36, 18, -2 },
-		{ 11, 36, 19, -2 },
-		{ 10, 35, 20, -1 },
-		{ 9, 35, 21, -1 },
-		{ 9, 35, 21, -1 },
-		{ 8, 35, 22, -1 },
-		{ 7, 34, 23, 0 },
-		{ 6, 34, 24, 0 },
-		{ 6, 33, 25, 0 },
-		{ 5, 32, 26, 1 },
-		{ 4, 32, 27, 1 },
-		{ 4, 30, 28, 2 },
-		{ 3, 30, 29, 2 },
-		{ 3, 29, 29, 3 },
-	},
-};
-
-static void histb_vpss_mv310_load_coefficients(struct histb_vpss *vpss)
-{
-	unsigned int table, phase, tap;
-
-	for (table = 0; table < ARRAY_SIZE(histb_vpss_mv310_hcoef); table++) {
-		__le32 *dst = (void *)vpss->zme_coef + table * 0x100;
-
-		for (phase = 0; phase < 17; phase++)
-			for (tap = 0; tap < 6; tap += 2)
-				*dst++ = cpu_to_le32(histb_vpss_pack_16bit(
-					histb_vpss_mv310_hcoef[table][phase][tap],
-					histb_vpss_mv310_hcoef[table][phase][tap + 1]));
-	}
-	for (table = 0; table < ARRAY_SIZE(histb_vpss_mv310_vcoef); table++)
-		histb_vpss_load_zme_4t(vpss, 0x600 + table * 0x100,
-				     histb_vpss_mv310_vcoef[table]);
-}
-
-static u32 histb_vpss_mv310_hcoef_offset(u32 in, u32 out)
-{
-	if (out > in)
-		return 0;
-	if (out == in)
-		return 0x100;
-	if (out * 4 >= in * 3)
-		return 0x200;
-	if (out * 2 >= in)
-		return 0x300;
-	if (out * 3 >= in)
-		return 0x400;
-	return 0x500;
-}
-
-static u32 histb_vpss_mv310_vcoef_offset(u32 in, u32 out)
-{
-	return 0x600 + (out == in ? 0 : out * 2 >= in ? 1 : 2) * 0x100;
-}
-
-static void histb_vpss_mv310_build_node(struct histb_vpss *vpss,
-				     const struct histb_vpss_frame *frame,
-				     dma_addr_t output, u32 stride)
-{
-	u32 iw = frame->input_width ?: frame->width;
-	u32 ih = frame->input_height ?: frame->height;
-	bool tile = frame->input_layout == HISTB_VPSS_INPUT_MV310_TILE;
-	bool scale = iw != frame->width || ih != frame->height;
-	u32 cf = BIT(31) | BIT(28) | BIT(27) | BIT(26) | BIT(23);
-	u32 out = BIT(31) | BIT(29);
-	u32 ctrl = BIT(3);
-
-	memset(vpss->node, 0, HISTB_VPSS_NODE_SIZE);
-	if (iw > 1920 || frame->output_ten_bit)
-		ctrl |= BIT(20);
-	if (tile)
-		cf |= BIT(4);
-	/* BSP 10->8 tiled conversion reads the high-eight-bit surface. */
-	if (frame->input_ten_bit && (frame->output_ten_bit || !tile))
-		cf |= BIT(12);
-	if (frame->output_ten_bit)
-		out |= BIT(8);
-	if (frame->input_nv21)
-		out |= BIT(16);
-	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL, ctrl);
-	histb_vpss_node_write(vpss, MV310_VPSS_NODE_ID, 1);
-	histb_vpss_node_write(vpss, MV310_VPSS_INT_MASK, MV310_VPSS_IRQ_ENABLE);
-	histb_vpss_node_write(vpss, MV310_VPSS_CHN_CFG, 2);
-	histb_vpss_node_write(vpss, 0x10, GENMASK(28, 1));
-	histb_vpss_node_write(vpss, 0x14, GENMASK(16, 0));
-	histb_vpss_node_write(vpss, MV310_VPSS_STT_ADDR, lower_32_bits(vpss->stt_dma));
-	histb_vpss_node_write(vpss, MV310_VPSS_CF_CTRL, cf);
-	histb_vpss_node_write(vpss, MV310_VPSS_CF_SIZE, (ih - 1) << 16 | (iw - 1));
-	histb_vpss_node_write(vpss, MV310_VPSS_CF_Y,
-			      lower_32_bits(frame->input_dma + frame->input_y_offset));
-	histb_vpss_node_write(vpss, MV310_VPSS_CF_C,
-			      lower_32_bits(frame->input_dma + frame->input_c_offset));
-	histb_vpss_node_write(vpss, MV310_VPSS_CF_STRIDE,
-			      frame->input_c_stride << 16 | frame->input_stride);
-	if (frame->input_ten_bit && tile && frame->output_ten_bit) {
-		histb_vpss_node_write(vpss, MV310_VPSS_CF_LOW_Y,
-			lower_32_bits(frame->input_dma + frame->input_low_y_offset));
-		histb_vpss_node_write(vpss, MV310_VPSS_CF_LOW_C,
-			lower_32_bits(frame->input_dma + frame->input_low_c_offset));
-		histb_vpss_node_write(vpss, MV310_VPSS_CF_LOW_STRIDE,
-			frame->input_low_stride << 16 | frame->input_low_stride);
-	}
-	if (scale) {
-		u32 hcoef = histb_vpss_mv310_hcoef_offset(iw, frame->width);
-		u32 vcoef = histb_vpss_mv310_vcoef_offset(ih, frame->height);
-		u32 ccoef = histb_vpss_mv310_vcoef_offset(iw, frame->width);
-
-		histb_vpss_node_write(vpss, HISTB_VPSS_CTRL3, BIT(3) | BIT(17));
-		histb_vpss_node_write(vpss, 0x688, (ih - 1) << 16 | (iw - 1));
-		histb_vpss_node_write(vpss, 0x18,
-			(frame->height - 1) << 16 | (frame->width - 1));
-		histb_vpss_node_write(vpss, 0x3c,
-			lower_32_bits(vpss->node_dma + 0x2000));
-		histb_vpss_node_write(vpss, 0x1c,
-			lower_32_bits(vpss->zme_coef_dma + hcoef));
-		histb_vpss_node_write(vpss, 0x20,
-			lower_32_bits(vpss->zme_coef_dma + vcoef));
-		histb_vpss_node_write(vpss, 0x24,
-			lower_32_bits(vpss->zme_coef_dma + ccoef));
-		histb_vpss_node_write(vpss, 0x28,
-			lower_32_bits(vpss->zme_coef_dma + vcoef));
-		histb_vpss_node_write(vpss, 0x2000, BIT(31) | BIT(30) |
-			BIT(26) | BIT(25) | div_u64((u64)iw << 20, frame->width));
-		histb_vpss_node_write(vpss, 0x200c, BIT(31) | BIT(30) |
-			BIT(24) | BIT(23) | BIT(21));
-		histb_vpss_node_write(vpss, 0x2010,
-			div_u64((u64)ih << 12, frame->height));
-	}
-	histb_vpss_node_write(vpss, MV310_VPSS_OUT_CTRL, out);
-	histb_vpss_node_write(vpss, MV310_VPSS_OUT_SIZE,
-			      (frame->height - 1) << 16 | (frame->width - 1));
-	histb_vpss_node_write(vpss, MV310_VPSS_OUT_Y, lower_32_bits(output));
-	histb_vpss_node_write(vpss, MV310_VPSS_OUT_C,
-			      lower_32_bits(output + stride * frame->height));
-	histb_vpss_node_write(vpss, MV310_VPSS_OUT_STRIDE, stride << 16 | stride);
-}
-
-static bool histb_vpss_mv310_plane_valid(const struct histb_vpss_frame *frame,
-				       u32 offset, u32 stride, u32 rows)
-{
-	u64 end = (u64)offset + (u64)stride * rows;
-
-	return !(offset & 15) && end <= frame->input_size;
-}
-
-static void histb_vpss_mv310_unpack_nv12(struct histb_vpss *vpss,
-				       const struct histb_vpss_frame *frame,
-				       u32 packed_stride)
-{
-	const u8 *src = vpss->staging_cpu;
-	u8 *dst = frame->output_cpu;
-	u32 plane, row, x;
-
-	for (plane = 0; plane < 2; plane++) {
-		u32 rows = plane ? frame->height / 2 : frame->height;
-		u32 src_base = plane ? packed_stride * frame->height : 0;
-		u32 dst_base = plane ? frame->output_stride * frame->height : 0;
-
-		for (row = 0; row < rows; row++) {
-			const u8 *s = src + src_base + row * packed_stride;
-			u8 *d = dst + dst_base + row * frame->output_stride;
-
-			for (x = 0; x < frame->width; x += 4, s += 5, d += 4) {
-				d[0] = (s[0] >> 2) | (s[1] << 6);
-				d[1] = (s[1] >> 4) | (s[2] << 4);
-				d[2] = (s[2] >> 6) | (s[3] << 2);
-				d[3] = s[4];
-			}
-		}
-	}
-}
-
-static int histb_vpss_mv310_detile(struct histb_vpss *vpss,
-				  const struct histb_vpss_frame *frame)
-{
-	struct histb_vpss_frame packed_frame;
-	const struct histb_vpss_frame *hwframe = frame;
-	dma_addr_t output;
-	unsigned long timeout;
-	u32 iw, ih, rows, crows, stride, min_stride;
-	size_t required_output_size;
-	bool tile, direct, downconvert;
-	int ret;
-
-	if (!frame || !frame->width || !frame->height || !frame->input_size)
-		return -EINVAL;
-	if (frame->input_layout != HISTB_VPSS_INPUT_MV310_TILE &&
-	    frame->input_layout != HISTB_VPSS_INPUT_MV310_LINEAR)
-		return -EINVAL;
-	if (frame->input_packed_yuv || frame->output_packed_yuv ||
-	    frame->hdr10_to_sdr)
-		return -EOPNOTSUPP;
-	tile = frame->input_layout == HISTB_VPSS_INPUT_MV310_TILE;
-	downconvert = !tile && frame->input_ten_bit && !frame->output_ten_bit;
-	iw = frame->input_width ?: frame->width;
-	ih = frame->input_height ?: frame->height;
-	if (iw < 32 || ih < 16 || iw > 4096 || ih > 2304 ||
-	    frame->width < 32 || frame->height < 8 ||
-	    frame->width > 4096 || frame->height > 2304 ||
-	    (iw | frame->width) & 3 || (ih | frame->height) & 1 ||
-	    !is_power_of_2(frame->input_height_align) ||
-	    frame->input_height_align > 256 ||
-	    iw >= frame->width * 16 || ih >= frame->height * 16)
-		return -EINVAL;
-	if ((frame->output_ten_bit && !frame->input_ten_bit) ||
-	    ((frame->output_ten_bit || downconvert) &&
-	     (iw != frame->width || ih != frame->height)))
-		return -EOPNOTSUPP;
-	/* Four-pixel operation requires four-line-aligned geometry. */
-	if ((iw > 1920 || frame->output_ten_bit || downconvert) &&
-	    ((ih | frame->height) & 3))
-		return -EINVAL;
-	min_stride = !tile && frame->input_ten_bit ? iw * 5 / 4 : iw;
-	if (frame->input_stride < min_stride || frame->input_stride > U16_MAX ||
-	    frame->input_c_stride < min_stride || frame->input_c_stride > U16_MAX ||
-	    (frame->input_stride | frame->input_c_stride) & 15 ||
-	    (tile && ((frame->input_stride & 63) || frame->input_height_align < 16)))
-		return -EINVAL;
-	rows = ALIGN(ih, frame->input_height_align);
-	crows = rows / 2;
-	if (!histb_vpss_dma_valid(vpss, frame->input_dma, frame->input_size) ||
-	    !histb_vpss_mv310_plane_valid(frame, frame->input_y_offset,
-					frame->input_stride, rows) ||
-	    !histb_vpss_mv310_plane_valid(frame, frame->input_c_offset,
-					frame->input_c_stride, crows))
-		return -ERANGE;
-	if (tile && frame->input_ten_bit && frame->output_ten_bit &&
-	    (frame->input_low_stride < DIV_ROUND_UP(iw, 4) ||
-	     frame->input_low_stride > U16_MAX || frame->input_low_stride & 15 ||
-	     !histb_vpss_mv310_plane_valid(frame, frame->input_low_y_offset,
-					 frame->input_low_stride, rows) ||
-	     !histb_vpss_mv310_plane_valid(frame, frame->input_low_c_offset,
-					 frame->input_low_stride, crows)))
-		return -EINVAL;
-	if (frame->output_stride > U16_MAX ||
-	    frame->output_stride < frame->width * (frame->output_ten_bit ? 2 : 1))
-		return -EINVAL;
-	ret = histb_vpss_output_size(frame, &required_output_size);
-	if (ret)
-		return ret;
-	if (frame->output_size < required_output_size)
-		return -EINVAL;
-	direct = !frame->output_ten_bit && !downconvert && frame->output_dma;
-	if (!direct && !frame->output_cpu)
-		return -EINVAL;
-	if (direct && ((frame->output_stride & 63) || frame->output_stride > U16_MAX ||
-	    !histb_vpss_dma_valid(vpss, frame->output_dma,
-				  required_output_size)))
-		return -EINVAL;
-	/* Packed linear 10-bit has no separate high-eight-bit plane to select.
-	 * Keep the documented native 10->10 hardware route and truncate only
-	 * after CF/OUT have produced a linear surface; never CPU-detile it.
-	 */
-	if (downconvert) {
-		packed_frame = *frame;
-		packed_frame.output_ten_bit = true;
-		hwframe = &packed_frame;
-	}
-
-	mutex_lock(&vpss->lock);
-	if (direct) {
-		output = frame->output_dma;
-		stride = frame->output_stride;
-	} else {
-		ret = histb_vpss_prepare_staging(vpss, hwframe);
-		if (ret)
-			goto unlock;
-		output = vpss->staging_dma;
-		stride = histb_vpss_output_stride(hwframe);
-	}
-	ret = pm_runtime_resume_and_get(vpss->dev);
-	if (ret < 0)
-		goto unlock;
-	if (vpss->engine_faulted) {
-		ret = -EIO;
-		goto put;
-	}
-	histb_vpss_mv310_build_node(vpss, hwframe, output, stride);
-	reinit_completion(&vpss->completion);
-	vpss->irq_state = 0;
-	if (!direct)
-		dma_sync_single_for_device(vpss->dev, output, vpss->staging_size,
-					   DMA_FROM_DEVICE);
-	writel(MV310_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
-	dma_wmb();
-	writel(lower_32_bits(vpss->node_dma), vpss->regs + HISTB_VPSS_NEXT);
-	wmb();
-	writel(1, vpss->regs + HISTB_VPSS_START);
-	timeout = wait_for_completion_timeout(&vpss->completion,
-					msecs_to_jiffies(HISTB_VPSS_JOB_TIMEOUT_MS));
-	ret = !timeout ? -ETIMEDOUT :
-		vpss->irq_state & MV310_VPSS_INT_ERROR ? -EIO : 0;
-	if (ret) {
-		/* Reset quiesces DMA before returning ownership to the decoder. */
-		histb_vpss_reset(vpss);
-	} else if (!direct) {
-		dma_sync_single_for_cpu(vpss->dev, output, vpss->staging_size,
-					DMA_FROM_DEVICE);
-		/* Only linear packing changes here; detiling is done by CF. */
-		if (downconvert)
-			histb_vpss_mv310_unpack_nv12(vpss, frame, stride);
-		else if (frame->output_ten_bit)
-			histb_vpss_unpack_p010(vpss, frame);
-		else
-			histb_vpss_copy_nv12(vpss, frame);
-	}
-put:
-	pm_runtime_mark_last_busy(vpss->dev);
-	pm_runtime_put_autosuspend(vpss->dev);
-unlock:
-	mutex_unlock(&vpss->lock);
-	return ret;
-}
-
 static void histb_vpss_build_node(struct histb_vpss *vpss,
 				  const struct histb_vpss_frame *frame,
 				  dma_addr_t output_dma, u32 output_stride)
@@ -1556,14 +1039,20 @@ static void histb_vpss_build_node(struct histb_vpss *vpss,
 	memset(vpss->node, 0, HISTB_VPSS_NODE_SIZE);
 	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL,
 			      HISTB_VPSS_CTRL_OUTPUT_EN |
-				HISTB_VPSS_CTRL_FOUR_PIX);
-	u32 in_fmt = frame->input_packed_yuv ? 1 : 0;
-	u32 out_fmt = frame->output_packed_yuv ? 1 : 0;
-	u32 ctrl2 = in_fmt | (out_fmt << 12);
-
-	if (frame->input_ten_bit)
-		ctrl2 |= HISTB_VPSS_CTRL2_IN_PIX_BITW;
-	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL2, ctrl2);
+				HISTB_VPSS_CTRL_FOUR_PIX |
+				FIELD_PREP(HISTB_VPSS_CTRL_PROT, prot & 3));
+	/* VPSS_REG_SetSttWrAddr(): every BSP node, including SetUHDNode. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_STT_W_ADDR,
+			      lower_32_bits(vpss->stt_dma));
+	/* NV12/NV12_TILE is CV200 format code 0; do not inherit stale state. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL2,
+			      frame->input_ten_bit ? HISTB_VPSS_CTRL2_IN_PIX_BITW : 0);
+	/*
+	 * CV200's SetPortCfg() always places VHD0 behind the port crop/LBA
+	 * window.  The old Linux UHD node only enabled ZME, leaving these bits
+	 * at reset values; that bypasses the same port state used by the BSP
+	 * and makes the scaler path depend on stale hardware state.
+	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL3,
 			      scale ? HISTB_VPSS_CTRL3_ZME_EN |
 			      HISTB_VPSS_CTRL3_VHD0_CROP_EN |
@@ -1654,8 +1143,6 @@ static void histb_vpss_build_node(struct histb_vpss *vpss,
 			      lower_32_bits(frame->input_dma + input_chroma));
 	histb_vpss_node_write(vpss, HISTB_VPSS_INPUT_STRIDE,
 			      frame->input_stride << 16 | frame->input_stride);
-	if (frame->hdr10_to_sdr)
-		output_ctrl |= HISTB_VPSS_OUTPUT_DITHER | HISTB_VPSS_OUTPUT_DITHER_ROUND | BIT(4);
 	histb_vpss_node_write(vpss, HISTB_VPSS_OUTPUT_CTRL, output_ctrl);
 	histb_vpss_node_write(vpss, HISTB_VPSS_OUTPUT_SIZE,
 			      (frame->height - 1) << 16 |
@@ -1666,7 +1153,8 @@ static void histb_vpss_build_node(struct histb_vpss *vpss,
 			      lower_32_bits(output_dma + output_stride * frame->height));
 	histb_vpss_node_write(vpss, HISTB_VPSS_OUTPUT_STRIDE,
 			      output_stride << 16 | output_stride);
-	histb_vpss_program_node_smmu(vpss);
+	histb_vpss_node_write(vpss, HISTB_VPSS_RCH_BYPASS, U32_MAX);
+	histb_vpss_node_write(vpss, HISTB_VPSS_WCH_BYPASS, U32_MAX);
 	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
 	histb_vpss_node_write(vpss, HISTB_VPSS_MISC,
 			      HISTB_VPSS_MISC_DEFAULT);
@@ -1717,9 +1205,11 @@ static void histb_vpss_dei_field(struct histb_vpss *vpss, u32 ctrl_off,
  * struct.  The remaining modules (SHARPNESS, ACM/COLOR, DCI, ARTDS, the
  * VDP's CSC) are REG_TYPE_VDP and are not part of the node.
  *
- * DM and SNR have source-size variants. This image carries the common and
- * SD words; histb_vpss_pq_hd overrides the FHD words within the 1920x1088
- * limit enforced by this driver's DEI interface.
+ * 2116 rows collapse to the 352 words below.  DM and SNR have per source
+ * size rows (SD/HD/UHD); this image holds the source independent rows plus
+ * the SD variants, and histb_vpss_pq_hd carries the nine words the FHD set
+ * changes.  The block only runs up to 1920x1088, so those are the only two
+ * sets reachable from here.
  */
 struct histb_vpss_pq_default {
 	u32 reg;
@@ -1829,42 +1319,6 @@ static const struct histb_vpss_pq_default histb_vpss_pq_hd[] = {
 	{ 0x30d0, 0x0007d000u },
 };
 
-static void histb_vpss_cv200_init(struct histb_vpss *vpss)
-{
-	histb_vpss_program_smmu(vpss, true);
-	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
-	writel(U32_MAX, vpss->regs + HISTB_VPSS_TIMEOUT);
-	writel(vpss->backend->irq_enable,
-	       vpss->regs + HISTB_VPSS_INT_MASK);
-	writel(vpss->backend->int_all, vpss->regs + HISTB_VPSS_INT_CLEAR);
-}
-
-static const struct histb_vpss_backend histb_vpss_cv200_backend = {
-	.int_mask_reg = HISTB_VPSS_INT_MASK,
-	.int_all = HISTB_VPSS_INT_ALL,
-	.int_done = HISTB_VPSS_INT_DONE,
-	.int_error = HISTB_VPSS_INT_ERROR,
-	.irq_enable = 0xfe,
-	.dma_bits = 30,
-	.dma_valid = histb_vpss_cv200_dma_valid,
-	.init = histb_vpss_cv200_init,
-	.load_coefficients = histb_vpss_load_zme_coefficients,
-};
-
-static const struct histb_vpss_backend histb_vpss_mv310_backend = {
-	.mv310 = true,
-	.int_mask_reg = MV310_VPSS_INT_MASK,
-	.int_all = MV310_VPSS_INT_ALL,
-	.int_done = BIT(3),
-	.int_error = MV310_VPSS_INT_ERROR,
-	.irq_enable = MV310_VPSS_IRQ_ENABLE,
-	.dma_bits = 32,
-	.dma_valid = histb_vpss_mv310_dma_valid,
-	.init = histb_vpss_mv310_init,
-	.load_coefficients = histb_vpss_mv310_load_coefficients,
-	.detile = histb_vpss_mv310_detile,
-};
-
 int histb_vpss_dei(struct histb_vpss *vpss,
 		   const struct histb_vpss_dei_frame *frame,
 		   dma_addr_t output_dma)
@@ -1884,17 +1338,15 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	if (!vpss || !frame || !frame->width || !frame->height || !stride ||
 	    !output_stride)
 		return -EINVAL;
-	if (vpss->backend->mv310)
-		return -EOPNOTSUPP;
-	if (frame->width > HISTB_VPSS_DEI_MAX_WIDTH || frame->width & 1 ||
-	    frame->height > HISTB_VPSS_DEI_MAX_HEIGHT / 2)
+	if (frame->width > HISTB_VPSS_DEI_MAX_WIDTH ||
+	    frame->height * 2 > HISTB_VPSS_DEI_MAX_HEIGHT)
 		return -EINVAL;
 	if (stride & 15 || stride < frame->width * (frame->ten_bit ? 2 : 1))
 		return -EINVAL;
 	if (output_stride & 15 ||
 	    output_stride < frame->width * (frame->ten_bit ? 2 : 1))
 		return -EINVAL;
-	if (stride > U16_MAX || output_stride > U16_MAX)
+	if (stride > U32_MAX / 2)
 		return -EINVAL;
 	if (!frame->ref_dma || !frame->cur_dma || !frame->nxt1_dma ||
 	    !frame->nxt2_dma || !output_dma)
@@ -1903,17 +1355,6 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	    upper_32_bits(frame->nxt1_dma) || upper_32_bits(frame->nxt2_dma) ||
 	    upper_32_bits(output_dma))
 		return -EINVAL;
-	if (!histb_media_smmu_dma_range_valid(frame->ref_dma,
-					      (size_t)stride * frame->height * 3) ||
-	    !histb_media_smmu_dma_range_valid(frame->cur_dma,
-					      (size_t)stride * frame->height * 3) ||
-	    !histb_media_smmu_dma_range_valid(frame->nxt1_dma,
-					      (size_t)stride * frame->height * 3) ||
-	    !histb_media_smmu_dma_range_valid(frame->nxt2_dma,
-					      (size_t)stride * frame->height * 3) ||
-	    !histb_media_smmu_dma_range_valid(output_dma,
-					      (size_t)output_stride * frame->height * 3))
-		return -ERANGE;
 
 	/*
 	 * frame->height is the height of one field; the block reads a field out
@@ -1937,10 +1378,6 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	ret = pm_runtime_resume_and_get(vpss->dev);
 	if (ret < 0)
 		goto unlock;
-	if (vpss->engine_faulted) {
-		ret = -EIO;
-		goto put;
-	}
 
 	ret = histb_vpss_prepare_dei_st(vpss, frame->width, frame->height);
 	if (ret < 0)
@@ -1949,7 +1386,14 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	st_stride = histb_vpss_dei_st_stride(frame->width);
 	st_slot = st_stride * frame->height;
 
-	/* VPSS_NEXT points to the complete register image in DMA memory. */
+	/*
+	 * Everything goes into the node image, not into the register window:
+	 * the engine reads its register set from the descriptor that
+	 * VPSS_NEXT points at, which is how the scaler path works too.
+	 * Writing the live registers instead leaves NEXT at zero, the engine
+	 * finds no node to run and the job times out - measured as
+	 * diesta = 0, intstat = 0, next = 0 with every other field correct.
+	 */
 	memset(vpss->node, 0, HISTB_VPSS_NODE_SIZE);
 
 	/*
@@ -1976,21 +1420,6 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 			histb_vpss_node_write(vpss, histb_vpss_pq_hd[i].reg,
 					      histb_vpss_pq_hd[i].value);
 
-	if (frame->pq.sharpness && frame->pq.sharpness != 50) {
-		u32 boost = (frame->pq.sharpness > 50) ? (frame->pq.sharpness - 50) : 0;
-		histb_vpss_node_write(vpss, HISTB_VPSS_DEI_PARAM_BASE + 0x08,
-				      0xfec00200u + (boost << 8));
-	}
-	if (frame->pq.brightness && frame->pq.brightness != 50) {
-		s32 b_offset = ((s32)frame->pq.brightness - 50) * 4;
-		u32 bk = 0x02080200;
-		if (b_offset > 0)
-			bk += (u32)b_offset;
-		else
-			bk -= (u32)(-b_offset);
-		histb_vpss_node_write(vpss, HISTB_VPSS_VHD0LBA_BK, bk);
-	}
-
 	/*
 	 * VPSS_HAL_SetH265DeiCfg() - the vendor's de-interlace configuration
 	 * for this block - is what the control word below reproduces:
@@ -2009,7 +1438,22 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 */
 	ctrl = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL);
 	ctrl |= HISTB_VPSS_CTRL_DEI_EN | HISTB_VPSS_CTRL_OUTPUT_EN;
-	/* The BSP's linear four-field node leaves four_pix_en clear. */
+	/*
+	 * FOUR_PIX is what histb_vpss_build_node() - the detile/scaler path,
+	 * which the engine completes on every frame - sets and the DEI path
+	 * did not.  The de-interlacer's motion estimator works on four-pixel
+	 * groups, so it is a plausible start condition.
+	 */
+	/*
+	 * four_pix_en stays clear.  This bit is set by the detile node, whose
+	 * input is a tiled surface, and the de-interlace node never has it:
+	 * VPSS_HAL_SetNode_H265_Step2_Dei() starts from ResetAppReg() - which
+	 * zeroes it - and only turns on prot, dei_en, bfield, ifmd_en, igbm_en,
+	 * dbm_en and the port, and the de-interlacer's own input here is a
+	 * linear surface.  The bit is the four-pixel group mode of the input
+	 * fetch, so enabling it for linear data leaves the fetch waiting for a
+	 * grouping the memory never produces.
+	 */
 	ctrl &= ~(u32)HISTB_VPSS_CTRL_FOUR_PIX;
 	/*
 	 * MCDI stays off, which is what the vendor's own de-interlace node
@@ -2024,15 +1468,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 * they were never sized for, and the frame never completed: no eof,
 	 * no ip_used, no error flag, and the next job could not start.
 	 */
-	if (frame->mcdi_en) {
-		ctrl |= HISTB_VPSS_CTRL_MCDI_EN;
-		if (frame->width > 960)
-			ctrl |= HISTB_VPSS_CTRL_MEDS_EN;
-		else
-			ctrl &= ~HISTB_VPSS_CTRL_MEDS_EN;
-	} else {
-		ctrl &= ~(u32)(HISTB_VPSS_CTRL_MCDI_EN | HISTB_VPSS_CTRL_MEDS_EN);
-	}
+	ctrl &= ~(u32)(HISTB_VPSS_CTRL_MCDI_EN | HISTB_VPSS_CTRL_MEDS_EN);
 	ctrl |= HISTB_VPSS_CTRL_BFIELD;		/* SetImgReadMod(HI_TRUE) */
 	ctrl |= HISTB_VPSS_CTRL_IGBM_EN;	/* SetIglbEn(HI_TRUE) */
 	ctrl |= HISTB_VPSS_CTRL_IFMD_EN;	/* SetIfmdEn(HI_TRUE) */
@@ -2049,54 +1485,22 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	/* VPSS_REG_SetStRdAddr/SetStWrAddr/SetStStride - motion statistics. */
 	histb_vpss_node_write(vpss, HISTB_VPSS_ST_RD_ADDR,
 			      lower_32_bits(vpss->dei_st_dma +
-					    (vpss->dei_st_seq % 3) * st_slot));
+					    (vpss->dei_st_seq %
+					     HISTB_VPSS_DEI_ST_SLOTS) * st_slot));
 	histb_vpss_node_write(vpss, HISTB_VPSS_ST_WR_ADDR,
 			      lower_32_bits(vpss->dei_st_dma +
-					    ((vpss->dei_st_seq + 1) % 3) * st_slot));
+					    ((vpss->dei_st_seq + 1) %
+					     HISTB_VPSS_DEI_ST_SLOTS) * st_slot));
 	histb_vpss_node_write(vpss, HISTB_VPSS_ST_STRIDE, st_stride);
 	vpss->dei_st_seq++;
-	if (frame->mcdi_en) {
-		u32 slot_cur = (3 + (vpss->dei_st_seq % 3)) * st_slot;
-		u32 slot_ref = (3 + ((vpss->dei_st_seq + 1) % 3)) * st_slot;
-		u32 slot_nxt = (3 + ((vpss->dei_st_seq + 2) % 3)) * st_slot;
-		dma_addr_t base = vpss->dei_st_dma;
-
-		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_CUR_ADDR,
-				      lower_32_bits(base + slot_cur));
-		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_REF_ADDR,
-				      lower_32_bits(base + slot_ref));
-		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_NX1_ADDR,
-				      lower_32_bits(base + slot_nxt));
-		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_STRIDE,
-				      st_stride | (st_stride << 16));
-		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMVNX1_STRIDE,
-				      st_stride);
-
-		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_CUR_ADDR,
-				      lower_32_bits(base + slot_cur));
-		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_NX1_ADDR,
-				      lower_32_bits(base + slot_nxt));
-		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_STRIDE,
-				      st_stride | (st_stride << 16));
-
-		histb_vpss_node_write(vpss, HISTB_VPSS_PRJH_CUR_ADDR,
-				      lower_32_bits(base + slot_cur));
-		histb_vpss_node_write(vpss, HISTB_VPSS_PRJCUR_STRIDE,
-				      st_stride);
-		histb_vpss_node_write(vpss, HISTB_VPSS_PRJV_NX2_ADDR,
-				      lower_32_bits(base + slot_nxt));
-		histb_vpss_node_write(vpss, HISTB_VPSS_PRJH_NX2_ADDR,
-				      lower_32_bits(base + slot_nxt));
-		histb_vpss_node_write(vpss, HISTB_VPSS_PRJNX2_STRIDE,
-				      st_stride);
-	}
 
 	/*
 	 * The de-interlaced frame leaves through the port - VHD0YADDR/CADDR/
 	 * STRIDE/SIZE and CTRL.vhd0_en below - which is what both of the BSP's
 	 * de-interlace nodes do.  VPSS_NX2Y_LB_ADDR/NX2C_LB_ADDR/NX2_LB_STRIDE
-	 * are the luma/chroma low-bit planes of a 10-bit input and remain clear
-	 * for an 8-bit input.
+	 * are the luma/chroma low bit planes of a 10-bit *input*, so they stay
+	 * clear for an 8-bit one; this driver used to point them at the output
+	 * buffer.
 	 */
 	/*
 	 * SetImgSize() of the de-interlace node: the image is the woven frame
@@ -2126,7 +1530,15 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 			     HISTB_VPSS_DEI_NXT2STRIDE, frame->nxt2_dma,
 			     field_stride, chroma_off);
 
-	/* Follow VPSS_HAL_SetFieldNode() for field-node pipeline state. */
+	/*
+	 * Bring the node up the way the vendor's field-node builder does
+	 * (VPSS_HAL_SetFieldNode in vpss_hal_3798cv200.c), because the block
+	 * checks state this driver was previously not setting at all:
+	 * pixel format and bit width in CTRL2, crop enable in CTRL3, and the
+	 * explicit disable of the replay/TNR/SNR stages in CTRL.  Writing CTRL
+	 * from scratch without those bits leaves the pipeline in a state the
+	 * de-interlacer will not start from.
+	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_MISC, HISTB_VPSS_MISC_DEFAULT);
 	histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, 0xff);
 	/*
@@ -2147,41 +1559,45 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 *             - sizeof(HI_U32)
 	 *
 	 * and VPSS_REG_SIZE_CALC() adds sizeof(HI_U32) back, so the value is
-	 * the plain offset of VPSS_DIECTRL inside the node: 0x1000.
+	 * the plain offset of VPSS_DIECTRL inside the node - 0x1000, the first
+	 * word of the block below.  This driver pointed the block 12 bytes
+	 * further in, which makes it read die_l_mode/die_c_mode and every
+	 * threshold after them from the wrong words: the visible register file
+	 * still looks right - the node carries the whole block - but the
+	 * block's own copy is misaligned, no de-interlace mode gets selected
+	 * and its state machine never leaves idle.  Measured before the fix:
+	 * DIESTA = 0, RAWINT = 0, EOF count = 0 with the node loaded and every
+	 * register in the block byte-for-byte correct.
 	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_ADDR,
 			      lower_32_bits(vpss->node_dma +
 					    HISTB_VPSS_DEI_PARAM_BASE));
 
-	/* Configure the remaining field-node pipeline stages. */
+	/* --- remaining BSP calls our driver never made --- */
 	{
 		u32 c = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL);
 
-		/* SetProtEn(FALSE) selects prot=2; zero is the secure encoding. */
+		/*
+		 * prot[24:23]: 0x2 is the BSP's NON-secure value, 0x0 secure
+		 * (VPSS_REG_SetProtEn); rfr/tnr/snr off, dbm for big frames.
+		 */
 		c &= ~(u32)(HISTB_VPSS_CTRL_PROT | HISTB_VPSS_CTRL_RFR_EN |
 			    HISTB_VPSS_CTRL_TNR_EN | HISTB_VPSS_CTRL_SNR_EN);
-		c |= HISTB_VPSS_CTRL_PROT_NONSECURE;
-		/* Match the four-field HAL's DBM size gate. */
+		c |= FIELD_PREP(HISTB_VPSS_CTRL_PROT, prot & 3);
+		/*
+		 * dbm_en stays clear.  The BSP turns it on for frames above
+		 * 128x64, and with the node now carrying the whole PQ table the
+		 * de-blocking block would have the same parameter block the BSP
+		 * gives it - so this was measured with dbm_en set (ctrl
+		 * 0x86000888) as well as clear.  Neither starts the
+		 * de-interlacer: diesta stayed 0 with every DB word at 0x2500-
+		 * 0x2688 and every SNR word at 0x3000-0x30d0 correct in the
+		 * register file.  The stage is left off because its
+		 * VPSS_DB_BORD_FLAG array (0x2900-0x2afc) has no PQ table rows
+		 * either, so enabling it buys nothing and leaves a second block
+		 * running on half-unknown configuration.
+		 */
 		c &= ~(u32)HISTB_VPSS_CTRL_DBM_EN;
-		if (frame->width > 128 && frame->height > 64)
-			c |= HISTB_VPSS_CTRL_DBM_EN;
-		if (frame->tnr_en) {
-			c |= HISTB_VPSS_CTRL_TNR_EN | HISTB_VPSS_CTRL_SNR_EN;
-			if (!histb_vpss_ensure_rfr(vpss, frame->width, frame->height * 2)) {
-				u32 rfr_stride = field_stride;
-				u32 rfr_chroma_off = rfr_stride * frame->height;
-				dma_addr_t rfr_dma = vpss->rfr_dma;
-
-				c |= HISTB_VPSS_CTRL_RFR_EN;
-				histb_vpss_node_write(vpss, HISTB_VPSS_RFR_Y_ADDR,
-						      lower_32_bits(rfr_dma));
-				histb_vpss_node_write(vpss, HISTB_VPSS_RFR_C_ADDR,
-						      lower_32_bits(rfr_dma + rfr_chroma_off));
-				histb_vpss_node_write(vpss, HISTB_VPSS_RFR_STRIDE,
-						      (rfr_stride << 16) | rfr_stride);
-				histb_vpss_node_write(vpss, HISTB_VPSS_RFR_CTRL, 0);
-			}
-		}
 		histb_vpss_node_write(vpss, HISTB_VPSS_CTRL, c);
 
 		/* SetDcmpEn(FALSE) - no compressed frame store. */
@@ -2208,20 +1624,25 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 				      ((((frame->height * 2) - 1) & 0x1fff) << 16) |
 				      ((frame->width - 1) & 0x1fff));
 
-	/* IGBM/IFMD write statistics to the region after the motion ring. */
+	/* SetSttWrAddr / SetTnrAddr / SetTnrClutAddr: the block wants these
+	 * offsets inside the node even when TNR is disabled.  VPSS_REG_SIZE_
+	 * CALC() nets out to the plain register offset, so these are 0x3800
+	 * and 0x3b00, not four bytes short of them. */
 	histb_vpss_node_write(vpss, HISTB_VPSS_STT_W_ADDR,
-			      lower_32_bits(vpss->dei_st_dma + vpss->dei_st_size -
-					    HISTB_VPSS_STT_W_SIZE));
-	u32 out_w = frame->target_width ? frame->target_width : frame->width;
-	u32 out_h = frame->target_height ? frame->target_height : (frame->height * 2);
-
-	histb_vpss_config_dei_port(vpss, frame->width, frame->height * 2,
-				   out_w, out_h);
+			      lower_32_bits(vpss->stt_dma));
+	histb_vpss_config_dei_port(vpss, frame->width, frame->height * 2);
 	histb_vpss_node_write(vpss, HISTB_VPSS_TNR_ADDR,
 			      lower_32_bits(vpss->node_dma + 0x3800));
 	histb_vpss_node_write(vpss, HISTB_VPSS_TNR_CLUT_ADDR,
 			      lower_32_bits(vpss->node_dma + 0x3b00));
-	/* Match the HAL's interrupt setup: EOF_END/IP_USED finish the job. */
+	/*
+	 * The engine loads this node into its own register file, so the node's
+	 * INTMASK is what actually governs interrupt delivery - the live
+	 * window copy is overwritten when the node is fetched.  The readback
+	 * showed intmask=0xff even after the live window was written with
+	 * 0xfe, which is exactly that overwrite.  Use 0xfe, i.e. eof unmasked
+	 * (0 = enabled), matching what the HAL leaves in the live window.
+	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, 0xfe);
 	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
 
@@ -2229,11 +1650,39 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	vpss->irq_state = 0;
 	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
-	/* VPSS_HAL_SetClockEn() writes the same mask to the live window. */
+	/*
+	 * VPSS_REG_SetIntMask(base, 0xfe) - the HAL unmasks exactly one bit
+	 * (eof) in the live window after every ResetAppReg.  0 = enabled, so
+	 * 0xfe leaves bit 0 clear.  This driver never set the live window at
+	 * all, and the node copy is 0xff (all masked), so no completion
+	 * interrupt could ever arrive.
+	 */
 	writel(0xfe, vpss->regs + HISTB_VPSS_INT_MASK);
-	/* The BSP submits the chain through live PNEXT and START registers. */
-	/* Bypass only when no identity SMMU page tables are available. */
-	histb_vpss_program_node_smmu(vpss);
+	/*
+	 * VPSS_REG_StartLogic() writes PNEXT and START into the *node*, not the
+	 * live window: it casts its pu32PhyAddr argument - the node address -
+	 * to VPSS_REG_S * and stores through that.  Writing the live window
+	 * instead leaves the engine looking for a start bit inside the node
+	 * that was never set, so it never begins and never raises a completion
+	 * interrupt.  Measured before the fix: start=0x0 and pnext=0x0 in the
+	 * live window while ctrl=0x86000088 (read from the node) was correct.
+	 */
+	/*
+	 * VPSS_REG_SetNodeID(): the BSP always stamps a node id before the
+	 * node is submitted.  With it left at zero the engine loads the node
+	 * (its CTRL is visible on readback) and then does nothing at all -
+	 * no completion interrupt, no error bit - which is exactly what we
+	 * measured.  Use 1, a non-zero user node id.
+	 */
+	/*
+	 * VPSS_REG_SetRchSmmuBypass/WchSmmuBypass: the BSP unconditionally
+	 * programs both to 0xffffffff (bypass) for every node it builds.  A
+	 * non-bypassed channel with no page tables installed would stall every
+	 * bus access the engine makes, which matches the readout: the engine
+	 * loads the node, then neither completes nor reports an error.
+	 */
+	histb_vpss_node_write(vpss, HISTB_VPSS_RCH_BYPASS, 0xffffffff);
+	histb_vpss_node_write(vpss, HISTB_VPSS_WCH_BYPASS, 0xffffffff);
 
 	/*
 	 * Port/VHD0 output: the de-interlaced frame is one progressive frame of
@@ -2242,12 +1691,23 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 * SetFrmSize(h, w), SetFrmAddr(Y, C), SetFrmStride(outYStride, ...),
 	 * SetFrmFormat(format), EnPort(TRUE) - and it uses the *destination*
 	 * stride, not the input's.
+	 *
+	 * This driver wrote the frame with twice the input pitch and a doubled
+	 * stride (borrowed from VPSS_HAL_SetNode_H265_Step1_Interlace, which
+	 * writes the *interlaced* surface, not the de-interlaced one).  A
+	 * 1088 line frame at a 4096 pitch is 4.4 MB, and the capture surface it
+	 * aims at is 1920 x 1088 x 1.5 = 3.1 MB: the port's last writes leave
+	 * the buffer entirely, and with both SMMU channels bypassed an access
+	 * with no backing never completes, so the frame neither finishes nor
+	 * reports an error and the block stays busy.
 	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_SIZE,
-			      ((out_h - 1) << 16) | (out_w - 1));
+			      ((frame->height * 2 - 1) << 16) |
+			      (frame->width - 1));
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_Y_ADDR, lower_32_bits(output_dma));
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_C_ADDR,
-			      lower_32_bits(output_dma + output_stride * out_h));
+			      lower_32_bits(output_dma +
+					    output_stride * frame->height * 2));
 	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_STRIDE,
 			      output_stride << 16 | output_stride);
 	{
@@ -2267,7 +1727,17 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 * fills them in, from buffers sized by the MCDI allocator.
 	 */
 
-	/* This job has one node, at index zero, and no following node. */
+	/*
+	 * VPSS_REG_SetNodeId(): the node id is the node's *index* inside the
+	 * block's node chain - VPSS_BaseOpt_...() and the split-MCDI builder
+	 * both stamp it as `pstVirAddrNodeX->VPSS_NODEID.u32 = u32Idx` - so a
+	 * job made of one node carries id 0.  This driver had been stamping 1
+	 * on the guess that any non-zero id would do; the engine then had a
+	 * chain that starts at 1, loaded the node, waited for the node before
+	 * it and never finished the list: no eof, no ip_used, no error flag,
+	 * and the block stayed busy.  The detile node - which completes -
+	 * leaves the id at zero.
+	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_NODE_ID, 0);
 	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
 	histb_vpss_node_write(vpss, HISTB_VPSS_START, 1);
@@ -2277,11 +1747,19 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	writel(0, vpss->regs + HISTB_VPSS_VHD0CROP_POS);
 	writel(histb_vpss_node_read(vpss, HISTB_VPSS_VHD0CROP_SIZE),
 	       vpss->regs + HISTB_VPSS_VHD0CROP_SIZE);
-	/* Publish the complete node before starting the engine. */
+	/* Keep the live window consistent too: harmless, and it is what the
+	 * scaler path already does. */
 	writel(lower_32_bits(vpss->node_dma), vpss->regs + HISTB_VPSS_NEXT);
 	wmb();
 	writel(1, vpss->regs + HISTB_VPSS_START);
-	/* Match VPSS_DRV_Set_VPSS_PNEXT()'s posted-write readback. */
+	/*
+	 * PNEXT is a live register the engine takes the job from - the
+	 * vendor's VPSS_DRV_Set_VPSS_PNEXT() writes it and reads it straight
+	 * back to check the write landed.  Sample it here, before the wait:
+	 * the timeout dump below reads it 500 ms later, when the value is
+	 * either the same or long cleared, so it cannot tell "the engine took
+	 * the job" from "the store never landed" - this can.
+	 */
 	pnext_ack = readl(vpss->regs + HISTB_VPSS_NEXT);
 
 	timeout = wait_for_completion_timeout(&vpss->completion,
@@ -2298,7 +1776,15 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 				pnext_ack,
 				readl(vpss->regs + HISTB_VPSS_START),
 				readl(vpss->regs + HISTB_VPSS_CTRL));
-			/* Record raw status and the field slots latched from the node. */
+			/*
+			 * INTSTATE is the masked view and this driver leaves
+			 * only eof unmasked, so it hides the block's own error
+			 * flags; RAWINT is the unmasked one and it is the only
+			 * way to tell "the engine ran and faulted" from "the
+			 * engine never started".  EOFCNT counts completed
+			 * frames.  0x100-0x13c are the four field slots the
+			 * engine latched out of the node.
+			 */
 			dev_err(vpss->dev,
 				"dei raw=%#x eofcnt=%#x ctrl2=%#x ctrl3=%#x imgsize=%#x refsize=%#x nodeid=%#x\n",
 				readl(vpss->regs + HISTB_VPSS_RAW_INT),
@@ -2340,7 +1826,15 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 			dev_err(vpss->dev, "dei diesta=%#x\n",
 				readl(vpss->regs + HISTB_VPSS_DIESTA));
 			histb_vpss_dump_state(vpss, "dei");
-			/* Dump the PQ parameter regions at their node offsets. */
+			/*
+			 * The DB/DM/DR/DS, SNR and TNR regions of the node image.
+			 * The engine reflects the node it loads into this
+			 * register file at the node's own offsets - which is how
+			 * the DEI words above became readable at all - so these
+			 * lines say both whether the PQ image reached the block
+			 * and whether the offsets the PQ table uses are the
+			 * block's real ones.
+			 */
 			{
 				static const u32 pq_dump[] = {
 					0x2000, 0x2500, 0x2600, 0x2700,
@@ -2382,11 +1876,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 		ret = 0;
 	}
 
-	/* A failed field node must stop touching the shared DMA surfaces. */
-	if (ret)
-		histb_vpss_reset(vpss);
-	if (vpss->clock_enabled)
-		writel(0, vpss->regs + HISTB_VPSS_CTRL);
+	writel(0, vpss->regs + HISTB_VPSS_CTRL);
 put:
 	pm_runtime_put(vpss->dev);
 unlock:
@@ -2399,7 +1889,6 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 		      const struct histb_vpss_frame *frame)
 {
 	size_t required_input_size;
-	size_t required_output_size;
 	u32 input_width;
 	u32 input_height;
 	bool direct_output;
@@ -2408,22 +1897,15 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 	unsigned long timeout;
 	int ret;
 
-	if (vpss && vpss->backend->detile)
-		return vpss->backend->detile(vpss, frame);
-
 	if (!vpss || !frame || !frame->width || !frame->height ||
 	    !frame->input_stride || frame->width & 3 ||
-	    !is_power_of_2(frame->input_height_align) ||
-	    frame->input_height_align > U16_MAX ||
-	    frame->width > U16_MAX || frame->height > U16_MAX ||
-	    frame->input_stride > U16_MAX ||
+	    !frame->input_height_align ||
 	    frame->input_stride < (frame->input_width ?: frame->width) ||
 	    upper_32_bits(frame->input_dma))
 		return -EINVAL;
 	input_width = frame->input_width ?: frame->width;
 	input_height = frame->input_height ?: frame->height;
 	if (!input_width || !input_height || input_width & 3 ||
-	    input_width > U16_MAX || input_height > U16_MAX ||
 	    input_height & 1 || frame->height & 1 ||
 	    (u64)input_width >=
 		(u64)frame->width * HISTB_VPSS_ZME_MAX_REDUCTION ||
@@ -2435,29 +1917,18 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 		return ret;
 	if (frame->input_size && frame->input_size < required_input_size)
 		return -EINVAL;
-	if (!histb_media_smmu_dma_range_valid(frame->input_dma,
-					      required_input_size))
+	if ((u64)frame->input_dma + required_input_size > U32_MAX + 1ULL)
 		return -ERANGE;
-	ret = histb_vpss_output_size(frame, &required_output_size);
-	if (ret)
-		return ret;
-	if (frame->output_size < required_output_size)
-		return -EINVAL;
 	if (frame->output_stride <
 	    frame->width * (frame->output_ten_bit ? 2 : 1) ||
 	    upper_32_bits(frame->output_dma))
 		return -EINVAL;
-	direct_output = !frame->output_ten_bit && frame->output_dma;
+	direct_output = !frame->output_ten_bit && frame->output_dma &&
+			!(force_staging && frame->output_cpu);
 	if ((!direct_output && !frame->output_cpu) ||
 	    (direct_output &&
 	     frame->output_stride < histb_vpss_output_stride(frame)))
 		return -EINVAL;
-	if (histb_vpss_output_stride(frame) > U16_MAX ||
-	    (direct_output &&
-	     (frame->output_stride > U16_MAX ||
-	      !histb_media_smmu_dma_range_valid(frame->output_dma,
-					       required_output_size))))
-		return -ERANGE;
 
 	mutex_lock(&vpss->lock);
 	if (direct_output) {
@@ -2474,10 +1945,6 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 	ret = pm_runtime_resume_and_get(vpss->dev);
 	if (ret < 0)
 		goto unlock;
-	if (vpss->engine_faulted) {
-		ret = -EIO;
-		goto put;
-	}
 
 	histb_vpss_build_node(vpss, frame, output_dma, output_stride);
 	reinit_completion(&vpss->completion);
@@ -2499,8 +1966,9 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 		dev_err(vpss->dev, "post-processing timed out\n");
 		ret = -ETIMEDOUT;
 	} else if (vpss->irq_state & HISTB_VPSS_INT_ERROR) {
-		dev_err(vpss->dev, "post-processing failed, state=%#x\n",
-			vpss->irq_state);
+		histb_vpss_report_failure(vpss, frame, vpss->irq_state,
+					  output_dma, output_stride,
+					  direct_output);
 		ret = -EIO;
 	} else {
 		if (!direct_output) {
@@ -2515,7 +1983,6 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 	}
 	if (ret)
 		histb_vpss_reset(vpss);
-put:
 	pm_runtime_mark_last_busy(vpss->dev);
 	pm_runtime_put_autosuspend(vpss->dev);
 
@@ -2571,30 +2038,28 @@ static int histb_vpss_runtime_resume(struct device *dev)
 	if (ret)
 		return ret;
 	udelay(1);
-	if (!vpss->backend->mv310) {
-		ret = clk_set_rate(vpss->clock, HISTB_VPSS_CORE_RATE);
-		if (ret)
-			return ret;
-		if (clk_get_rate(vpss->clock) != HISTB_VPSS_CORE_RATE) {
-			dev_err(vpss->dev, "VPSS core clock did not reach %lu Hz\n",
-				HISTB_VPSS_CORE_RATE);
-			return -EIO;
-		}
+	ret = clk_set_rate(vpss->clock, HISTB_VPSS_CORE_RATE);
+	if (ret)
+		return ret;
+	if (clk_get_rate(vpss->clock) != HISTB_VPSS_CORE_RATE) {
+		dev_err(vpss->dev, "VPSS core clock did not reach %lu Hz\n",
+			HISTB_VPSS_CORE_RATE);
+		return -EIO;
 	}
 	ret = clk_prepare_enable(vpss->clock);
 	if (ret)
 		return ret;
-	vpss->clock_enabled = true;
 	udelay(1);
 	ret = reset_control_deassert(vpss->reset);
 	if (ret) {
 		clk_disable_unprepare(vpss->clock);
-		vpss->clock_enabled = false;
 		return ret;
 	}
 	udelay(1);
-	vpss->engine_faulted = false;
-	vpss->backend->init(vpss);
+	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
+	writel(U32_MAX, vpss->regs + HISTB_VPSS_TIMEOUT);
+	writel(0xfe, vpss->regs + HISTB_VPSS_INT_MASK);
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	enable_irq(vpss->irq);
 	return 0;
 }
@@ -2604,21 +2069,15 @@ static int histb_vpss_runtime_suspend(struct device *dev)
 	struct histb_vpss *vpss = dev_get_drvdata(dev);
 	int ret;
 
-	if (!vpss->clock_enabled)
-		return 0;
-
 	disable_irq(vpss->irq);
-	writel(0, vpss->regs + histb_vpss_int_mask_reg(vpss));
-	writel(vpss->backend->int_all,
-	       vpss->regs + HISTB_VPSS_INT_CLEAR);
-	histb_vpss_program_smmu(vpss, false);
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_MASK);
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	ret = reset_control_assert(vpss->reset);
 	if (ret) {
 		enable_irq(vpss->irq);
 		return ret;
 	}
 	clk_disable_unprepare(vpss->clock);
-	vpss->clock_enabled = false;
 	return 0;
 }
 
@@ -2628,345 +2087,6 @@ static const struct dev_pm_ops histb_vpss_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
 				pm_runtime_force_resume)
 };
-struct histb_vpss_ctx {
-	struct v4l2_fh fh;
-	struct histb_vpss *vpss;
-	struct v4l2_pix_format src_fmt;
-	struct v4l2_pix_format dst_fmt;
-};
-
-static inline struct histb_vpss_ctx *fh_to_vpss_ctx(struct v4l2_fh *fh)
-{
-	return container_of(fh, struct histb_vpss_ctx, fh);
-}
-
-static int histb_vpss_m2m_queue_setup(struct vb2_queue *vq,
-				      unsigned int *nbuffers, unsigned int *nplanes,
-				      unsigned int sizes[], struct device *alloc_devs[])
-{
-	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vq);
-	struct v4l2_pix_format *pix = V4L2_TYPE_IS_OUTPUT(vq->type) ?
-				      &ctx->src_fmt : &ctx->dst_fmt;
-
-	if (*nplanes)
-		return sizes[0] < pix->sizeimage ? -EINVAL : 0;
-
-	*nplanes = 1;
-	sizes[0] = pix->sizeimage;
-	return 0;
-}
-
-static int histb_vpss_m2m_buf_prepare(struct vb2_buffer *vb)
-{
-	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
-	struct v4l2_pix_format *pix = V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) ?
-				      &ctx->src_fmt : &ctx->dst_fmt;
-
-	if (vb2_plane_size(vb, 0) < pix->sizeimage)
-		return -EINVAL;
-
-	return 0;
-}
-
-static void histb_vpss_m2m_buf_queue(struct vb2_buffer *vb)
-{
-	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
-	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
-
-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
-}
-
-static int histb_vpss_m2m_start_streaming(struct vb2_queue *vq, unsigned int count)
-{
-	return 0;
-}
-
-static void histb_vpss_m2m_stop_streaming(struct vb2_queue *vq)
-{
-	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vq);
-	struct vb2_v4l2_buffer *vbuf;
-
-	for (;;) {
-		if (V4L2_TYPE_IS_OUTPUT(vq->type))
-			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
-		else
-			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-
-		if (!vbuf)
-			break;
-		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
-	}
-}
-
-static const struct vb2_ops histb_vpss_m2m_qops = {
-	.queue_setup = histb_vpss_m2m_queue_setup,
-	.buf_prepare = histb_vpss_m2m_buf_prepare,
-	.buf_queue = histb_vpss_m2m_buf_queue,
-	.start_streaming = histb_vpss_m2m_start_streaming,
-	.stop_streaming = histb_vpss_m2m_stop_streaming,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
-};
-
-static void histb_vpss_m2m_device_run(void *priv)
-{
-	struct histb_vpss_ctx *ctx = priv;
-	struct histb_vpss *vpss = ctx->vpss;
-	struct vb2_v4l2_buffer *src_buf, *dst_buf;
-	struct histb_vpss_frame frame = { 0 };
-	int ret;
-
-	src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-
-	frame.input_dma = vb2_dma_contig_plane_dma_addr(&src_buf->vb2_buf, 0);
-	frame.output_dma = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
-	frame.output_size = vb2_plane_size(&dst_buf->vb2_buf, 0);
-	frame.input_width = ctx->src_fmt.width;
-	frame.input_height = ctx->src_fmt.height;
-	frame.width = ctx->dst_fmt.width;
-	frame.height = ctx->dst_fmt.height;
-	frame.input_stride = ctx->src_fmt.bytesperline;
-	frame.output_stride = ctx->dst_fmt.bytesperline;
-	frame.input_height_align = ALIGN(ctx->src_fmt.height, 16);
-	frame.input_packed_yuv = (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_YUYV ||
-				  ctx->src_fmt.pixelformat == V4L2_PIX_FMT_UYVY);
-	frame.output_packed_yuv = (ctx->dst_fmt.pixelformat == V4L2_PIX_FMT_YUYV ||
-				   ctx->dst_fmt.pixelformat == V4L2_PIX_FMT_UYVY);
-	if (vpss->backend->mv310) {
-		frame.input_layout = HISTB_VPSS_INPUT_MV310_LINEAR;
-		frame.input_size = vb2_plane_size(&src_buf->vb2_buf, 0);
-		frame.input_height_align = 1;
-		frame.input_c_offset = frame.input_stride * frame.input_height;
-		frame.input_c_stride = frame.input_stride;
-		frame.input_nv21 = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_NV21;
-	}
-
-	ret = histb_vpss_detile(vpss, &frame);
-
-	src_buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
-	dst_buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-
-	if (src_buf)
-		v4l2_m2m_buf_done(src_buf, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-	if (dst_buf) {
-		dst_buf->vb2_buf.timestamp = src_buf ? src_buf->vb2_buf.timestamp : 0;
-		v4l2_m2m_buf_done(dst_buf, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-	}
-	v4l2_m2m_job_finish(vpss->m2m_dev, ctx->fh.m2m_ctx);
-}
-
-static const struct v4l2_m2m_ops histb_vpss_m2m_ops = {
-	.device_run = histb_vpss_m2m_device_run,
-};
-
-static int histb_vpss_m2m_querycap(struct file *file, void *priv,
-				   struct v4l2_capability *cap)
-{
-	strscpy(cap->driver, "histb-vpss", sizeof(cap->driver));
-	strscpy(cap->card, "HiSilicon HiSTB Video Post Processor", sizeof(cap->card));
-	return 0;
-}
-
-static int histb_vpss_m2m_enum_fmt(struct file *file, void *priv,
-				   struct v4l2_fmtdesc *f)
-{
-	struct histb_vpss_ctx *ctx = fh_to_vpss_ctx(priv);
-
-	if (ctx->vpss->backend->mv310 &&
-	    (f->index > (V4L2_TYPE_IS_OUTPUT(f->type) ? 1 : 0)))
-		return -EINVAL;
-
-	switch (f->index) {
-	case 0:
-		f->pixelformat = V4L2_PIX_FMT_NV12;
-		break;
-	case 1:
-		f->pixelformat = V4L2_PIX_FMT_NV21;
-		break;
-	case 2:
-		f->pixelformat = V4L2_PIX_FMT_YUYV;
-		break;
-	case 3:
-		f->pixelformat = V4L2_PIX_FMT_UYVY;
-		break;
-	default:
-		return -EINVAL;
-	}
-	return 0;
-}
-
-static int histb_vpss_m2m_g_fmt(struct file *file, void *priv,
-				struct v4l2_format *f)
-{
-	struct histb_vpss_ctx *ctx = fh_to_vpss_ctx(priv);
-
-	f->fmt.pix = V4L2_TYPE_IS_OUTPUT(f->type) ? ctx->src_fmt : ctx->dst_fmt;
-	return 0;
-}
-
-static int histb_vpss_m2m_try_fmt(struct file *file, void *priv,
-				  struct v4l2_format *f)
-{
-	struct histb_vpss_ctx *ctx = fh_to_vpss_ctx(priv);
-	bool is_packed = (f->fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV ||
-			  f->fmt.pix.pixelformat == V4L2_PIX_FMT_UYVY);
-
-	if (ctx->vpss->backend->mv310) {
-		is_packed = false;
-		if (!V4L2_TYPE_IS_OUTPUT(f->type))
-			f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-	}
-
-	if (!is_packed && f->fmt.pix.pixelformat != V4L2_PIX_FMT_NV21)
-		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-
-	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.width = clamp_t(u32, ALIGN(f->fmt.pix.width, 16),
-				 ctx->vpss->backend->mv310 ? 32 : 16, 1920);
-	f->fmt.pix.height = clamp_t(u32, ALIGN(f->fmt.pix.height, 16), 16, 1088);
-
-	if (is_packed) {
-		f->fmt.pix.bytesperline = f->fmt.pix.width * 2;
-		f->fmt.pix.sizeimage = f->fmt.pix.bytesperline * f->fmt.pix.height;
-	} else {
-		f->fmt.pix.bytesperline = ctx->vpss->backend->mv310 ?
-			ALIGN(f->fmt.pix.width, 64) : f->fmt.pix.width;
-		f->fmt.pix.sizeimage = f->fmt.pix.bytesperline * f->fmt.pix.height * 3 / 2;
-	}
-	return 0;
-}
-
-static int histb_vpss_m2m_s_fmt(struct file *file, void *priv,
-				struct v4l2_format *f)
-{
-	struct histb_vpss_ctx *ctx = fh_to_vpss_ctx(priv);
-	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
-	int ret;
-
-	if (vb2_is_busy(vq))
-		return -EBUSY;
-
-	ret = histb_vpss_m2m_try_fmt(file, priv, f);
-	if (ret)
-		return ret;
-
-	if (V4L2_TYPE_IS_OUTPUT(f->type))
-		ctx->src_fmt = f->fmt.pix;
-	else
-		ctx->dst_fmt = f->fmt.pix;
-
-	return 0;
-}
-
-static const struct v4l2_ioctl_ops histb_vpss_m2m_ioctl_ops = {
-	.vidioc_querycap = histb_vpss_m2m_querycap,
-	.vidioc_enum_fmt_vid_cap = histb_vpss_m2m_enum_fmt,
-	.vidioc_enum_fmt_vid_out = histb_vpss_m2m_enum_fmt,
-	.vidioc_g_fmt_vid_cap = histb_vpss_m2m_g_fmt,
-	.vidioc_g_fmt_vid_out = histb_vpss_m2m_g_fmt,
-	.vidioc_try_fmt_vid_cap = histb_vpss_m2m_try_fmt,
-	.vidioc_try_fmt_vid_out = histb_vpss_m2m_try_fmt,
-	.vidioc_s_fmt_vid_cap = histb_vpss_m2m_s_fmt,
-	.vidioc_s_fmt_vid_out = histb_vpss_m2m_s_fmt,
-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
-	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
-	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
-	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
-	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
-	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
-	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
-	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
-	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
-};
-
-static int histb_vpss_m2m_queue_init(void *priv, struct vb2_queue *src_vq,
-				     struct vb2_queue *dst_vq)
-{
-	struct histb_vpss_ctx *ctx = priv;
-	int ret;
-
-	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
-	src_vq->drv_priv = ctx;
-	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
-	src_vq->ops = &histb_vpss_m2m_qops;
-	src_vq->mem_ops = &vb2_dma_contig_memops;
-	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
-	src_vq->lock = &ctx->vpss->dev_mutex;
-	src_vq->dev = ctx->vpss->dev;
-
-	ret = vb2_queue_init(src_vq);
-	if (ret)
-		return ret;
-
-	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
-	dst_vq->drv_priv = ctx;
-	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
-	dst_vq->ops = &histb_vpss_m2m_qops;
-	dst_vq->mem_ops = &vb2_dma_contig_memops;
-	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
-	dst_vq->lock = &ctx->vpss->dev_mutex;
-	dst_vq->dev = ctx->vpss->dev;
-
-	return vb2_queue_init(dst_vq);
-}
-
-static int histb_vpss_m2m_open(struct file *file)
-{
-	struct histb_vpss *vpss = video_drvdata(file);
-	struct histb_vpss_ctx *ctx;
-	int ret;
-
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
-		return -ENOMEM;
-
-	v4l2_fh_init(&ctx->fh, video_devdata(file));
-	file->private_data = &ctx->fh;
-	ctx->vpss = vpss;
-
-	ctx->src_fmt.pixelformat = V4L2_PIX_FMT_NV12;
-	ctx->src_fmt.width = 1280;
-	ctx->src_fmt.height = 720;
-	ctx->src_fmt.bytesperline = 1280;
-	ctx->src_fmt.sizeimage = 1280 * 720 * 3 / 2;
-	ctx->dst_fmt = ctx->src_fmt;
-
-	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(vpss->m2m_dev, ctx,
-					    histb_vpss_m2m_queue_init);
-	if (IS_ERR(ctx->fh.m2m_ctx)) {
-		ret = PTR_ERR(ctx->fh.m2m_ctx);
-		kfree(ctx);
-		return ret;
-	}
-
-	v4l2_fh_add(&ctx->fh);
-	return 0;
-}
-
-static int histb_vpss_m2m_release(struct file *file)
-{
-	struct histb_vpss_ctx *ctx = fh_to_vpss_ctx(file->private_data);
-
-	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
-	v4l2_fh_del(&ctx->fh);
-	v4l2_fh_exit(&ctx->fh);
-	kfree(ctx);
-
-	return 0;
-}
-
-static const struct v4l2_file_operations histb_vpss_m2m_fops = {
-	.owner = THIS_MODULE,
-	.open = histb_vpss_m2m_open,
-	.release = histb_vpss_m2m_release,
-	.poll = v4l2_m2m_fop_poll,
-	.unlocked_ioctl = video_ioctl2,
-	.mmap = v4l2_m2m_fop_mmap,
-};
-
 
 static int histb_vpss_probe(struct platform_device *pdev)
 {
@@ -2978,19 +2098,12 @@ static int histb_vpss_probe(struct platform_device *pdev)
 	if (!vpss)
 		return -ENOMEM;
 	vpss->dev = dev;
-	vpss->mv310 = of_device_is_compatible(dev->of_node,
-					    "hisilicon,hi3798mv310-vpss");
-	vpss->backend = vpss->mv310 ? &histb_vpss_mv310_backend :
-					&histb_vpss_cv200_backend;
 	vpss->regs = devm_platform_ioremap_resource(pdev, 0);
 	{
 		struct resource *res = platform_get_resource(pdev,
 							     IORESOURCE_MEM, 0);
 
 		vpss->regs_phys = res ? res->start : 0;
-		if (vpss->backend->mv310 && (!res || resource_size(res) < SZ_64K))
-			return dev_err_probe(dev, -EINVAL,
-					     "MV310 requires a 64 KiB aperture\n");
 	}
 	if (IS_ERR(vpss->regs))
 		return PTR_ERR(vpss->regs);
@@ -3005,87 +2118,66 @@ static int histb_vpss_probe(struct platform_device *pdev)
 	vpss->irq = platform_get_irq(pdev, 0);
 	if (vpss->irq < 0)
 		return vpss->irq;
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(vpss->backend->dma_bits));
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
-	if (vpss->backend->mv310) {
-		if (!dmam_alloc_coherent(dev, HISTB_VPSS_STT_W_SIZE,
-					 &vpss->stt_dma, GFP_KERNEL))
-			return -ENOMEM;
-	} else {
-		ret = histb_media_smmu_prepare_identity(&vpss->smmu, dev);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "failed to prepare media SMMU\n");
-		ret = devm_add_action_or_reset(dev,
-					histb_media_smmu_release_identity,
-					&vpss->smmu);
-		if (ret)
-			return ret;
-	}
 
-	vpss->node = dma_alloc_coherent(dev, HISTB_VPSS_TOTAL_NODE_SIZE,
+	vpss->node = dma_alloc_coherent(dev, HISTB_VPSS_NODE_SIZE,
 					&vpss->node_dma, GFP_KERNEL);
 	if (!vpss->node)
 		return -ENOMEM;
-	if (!histb_vpss_dma_valid(vpss, vpss->node_dma,
-				  HISTB_VPSS_TOTAL_NODE_SIZE)) {
+	if (upper_32_bits(vpss->node_dma)) {
 		ret = -ERANGE;
 		goto free_node;
 	}
-	vpss->zme_coef = (void *)vpss->node + HISTB_VPSS_NODE_SIZE;
-	vpss->zme_coef_dma = vpss->node_dma + HISTB_VPSS_NODE_SIZE;
-	vpss->backend->load_coefficients(vpss);
+	vpss->zme_coef = dma_alloc_coherent(dev, HISTB_VPSS_ZME_COEF_SIZE,
+					    &vpss->zme_coef_dma, GFP_KERNEL);
+	if (!vpss->zme_coef) {
+		ret = -ENOMEM;
+		goto free_node;
+	}
+	if (upper_32_bits(vpss->zme_coef_dma)) {
+		ret = -ERANGE;
+		goto free_zme_coef;
+	}
+	vpss->stt_cpu = dma_alloc_coherent(dev, HISTB_VPSS_STT_SIZE,
+					   &vpss->stt_dma, GFP_KERNEL);
+	if (!vpss->stt_cpu) {
+		ret = -ENOMEM;
+		goto free_zme_coef;
+	}
+	if (upper_32_bits(vpss->stt_dma)) {
+		ret = -ERANGE;
+		goto free_stt;
+	}
+	histb_vpss_load_zme_coefficients(vpss);
 	mutex_init(&vpss->lock);
 	init_completion(&vpss->completion);
 	platform_set_drvdata(pdev, vpss);
-	mutex_init(&vpss->dev_mutex);
-	ret = v4l2_device_register(dev, &vpss->v4l2_dev);
-	if (ret)
-		goto free_node;
-	vpss->m2m_dev = v4l2_m2m_init(&histb_vpss_m2m_ops);
-	if (IS_ERR(vpss->m2m_dev)) {
-		ret = PTR_ERR(vpss->m2m_dev);
-		vpss->m2m_dev = NULL;
-		goto unregister_v4l2;
-	}
-	strscpy(vpss->vfd.name, "histb-vpss", sizeof(vpss->vfd.name));
-	vpss->vfd.fops = &histb_vpss_m2m_fops;
-	vpss->vfd.ioctl_ops = &histb_vpss_m2m_ioctl_ops;
-	vpss->vfd.minor = -1;
-	vpss->vfd.release = video_device_release_empty;
-	vpss->vfd.lock = &vpss->dev_mutex;
-	vpss->vfd.v4l2_dev = &vpss->v4l2_dev;
-	vpss->vfd.vfl_dir = VFL_DIR_M2M;
-	vpss->vfd.device_caps = V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING;
-	video_set_drvdata(&vpss->vfd, vpss);
+
 	ret = devm_request_irq(dev, vpss->irq, histb_vpss_irq,
 			       IRQF_NO_AUTOEN, dev_name(dev), vpss);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "failed to request IRQ\n");
-		goto release_m2m;
+		goto free_stt;
 	}
+
 	pm_runtime_set_autosuspend_delay(dev, 1000);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_set_suspended(dev);
 	pm_runtime_enable(dev);
-	ret = video_register_device(&vpss->vfd, VFL_TYPE_VIDEO, -1);
-	if (ret) {
-		pm_runtime_disable(dev);
-		ret = dev_err_probe(dev, ret, "failed to register video device\n");
-		goto release_m2m;
-	}
-	dev_info(dev, "registered /dev/video%d for video post-processing\\n",
-		 vpss->vfd.num);
-	dev_info(dev, "registered native tile post-processor\\n");
+	dev_info(dev, "registered native tile post-processor (prot=%u, stt=%pad)\n",
+		 prot & 3, &vpss->stt_dma);
 	return 0;
 
-release_m2m:
-	v4l2_m2m_release(vpss->m2m_dev);
-unregister_v4l2:
-	v4l2_device_unregister(&vpss->v4l2_dev);
+free_stt:
+	dma_free_coherent(dev, HISTB_VPSS_STT_SIZE, vpss->stt_cpu,
+			  vpss->stt_dma);
+free_zme_coef:
+	dma_free_coherent(dev, HISTB_VPSS_ZME_COEF_SIZE,
+			  vpss->zme_coef, vpss->zme_coef_dma);
 free_node:
-	dma_free_coherent(dev, HISTB_VPSS_TOTAL_NODE_SIZE,
+	dma_free_coherent(dev, HISTB_VPSS_NODE_SIZE,
 			  vpss->node, vpss->node_dma);
 	return ret;
 }
@@ -3095,37 +2187,32 @@ static void histb_vpss_remove(struct platform_device *pdev)
 	struct histb_vpss *vpss = platform_get_drvdata(pdev);
 
 	pm_runtime_disable(vpss->dev);
-	if (vpss->vfd.v4l2_dev) {
-		video_unregister_device(&vpss->vfd);
-		v4l2_m2m_release(vpss->m2m_dev);
-		v4l2_device_unregister(&vpss->v4l2_dev);
-	}
 	if (!pm_runtime_status_suspended(vpss->dev))
 		histb_vpss_runtime_suspend(vpss->dev);
 	if (vpss->staging_cpu)
-		dma_free_noncoherent(vpss->dev, vpss->staging_size,
+		histb_dma_free_noncoherent(vpss->dev, vpss->staging_size,
 				     vpss->staging_cpu, vpss->staging_dma,
 				     DMA_FROM_DEVICE);
 	if (vpss->dei_st_cpu)
 		dma_free_coherent(vpss->dev, vpss->dei_st_size,
 				  vpss->dei_st_cpu, vpss->dei_st_dma);
-	if (vpss->rfr_cpu)
-		dma_free_coherent(vpss->dev, vpss->rfr_size,
-				  vpss->rfr_cpu, vpss->rfr_dma);
-	dma_free_coherent(vpss->dev, HISTB_VPSS_TOTAL_NODE_SIZE,
+	dma_free_coherent(vpss->dev, HISTB_VPSS_STT_SIZE,
+			  vpss->stt_cpu, vpss->stt_dma);
+	dma_free_coherent(vpss->dev, HISTB_VPSS_ZME_COEF_SIZE,
+			  vpss->zme_coef, vpss->zme_coef_dma);
+	dma_free_coherent(vpss->dev, HISTB_VPSS_NODE_SIZE,
 			  vpss->node, vpss->node_dma);
 }
 
 static const struct of_device_id histb_vpss_of_match[] = {
 	{ .compatible = "hisilicon,hi3798cv200-vpss" },
-	{ .compatible = "hisilicon,hi3798mv310-vpss" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_vpss_of_match);
 
 static struct platform_driver histb_vpss_driver = {
 	.probe = histb_vpss_probe,
-	.remove_new = histb_vpss_remove,
+	.remove = histb_vpss_remove,
 	.driver = {
 		.name = "histb-vpss",
 		.of_match_table = histb_vpss_of_match,
@@ -3134,5 +2221,6 @@ static struct platform_driver histb_vpss_driver = {
 };
 module_platform_driver(histb_vpss_driver);
 
+MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 video post-processing engine");
 MODULE_LICENSE("GPL");

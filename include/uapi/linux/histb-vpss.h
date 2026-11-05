@@ -6,8 +6,6 @@
 #include <linux/videodev2.h>
 
 #define HISTB_VPSS_DEI_TOP_FIELD_FIRST 1U
-#define HISTB_VPSS_DEI_MCDI_EN         2U
-#define HISTB_VPSS_DEI_TNR_EN          4U
 
 /*
  * Four dequeued, driver-owned MMAP NV12 capture surfaces, in field order:
@@ -19,8 +17,7 @@ struct histb_vpss_dei_request {
 	__u32 source[4];
 	__u32 bottom_mask;
 	__u32 destination;
-	__u32 target_width;
-	__u32 target_height;
+	__u32 reserved; /* must be zero */
 	__u32 flags;
 };
 
