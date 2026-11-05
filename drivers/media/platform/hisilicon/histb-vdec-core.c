@@ -994,10 +994,40 @@ static void histb_vdec_cached_dmabuf_release(struct dma_buf *dbuf)
 		histb_vdec_cached_free(buf);
 }
 
+/*
+ * dma_buf_vmap() rejects exporters that do not implement ->vmap, which makes
+ * any PRIME import through drm_gem_dma_prime_import_sg_table_vmap() fail with
+ * -EINVAL ("Failed to vmap PRIME buffer") and forces consumers such as
+ * histb-vdp onto their shadow-copy fallback. The capture buffer is allocated
+ * with dma_alloc_noncoherent(), so its CPU view already exists and stays valid
+ * for the whole lifetime of the buffer; cache maintenance keeps running
+ * through ->begin_cpu_access / ->end_cpu_access.
+ */
+static int histb_vdec_cached_dmabuf_vmap(struct dma_buf *dbuf,
+					 struct iosys_map *map)
+{
+	struct histb_vdec_cached_buf *buf = dbuf->priv;
+
+	if (!buf || !buf->cpu)
+		return -ENODEV;
+
+	iosys_map_set_vaddr(map, buf->cpu);
+
+	return 0;
+}
+
+static void histb_vdec_cached_dmabuf_vunmap(struct dma_buf *dbuf,
+					    struct iosys_map *map)
+{
+	iosys_map_clear(map);
+}
+
 static const struct dma_buf_ops histb_vdec_cached_dmabuf_ops = {
 	.map_dma_buf = histb_vdec_cached_dmabuf_map,
 	.unmap_dma_buf = histb_vdec_cached_dmabuf_unmap,
 	.mmap = histb_vdec_cached_dmabuf_mmap,
+	.vmap = histb_vdec_cached_dmabuf_vmap,
+	.vunmap = histb_vdec_cached_dmabuf_vunmap,
 	.begin_cpu_access = histb_vdec_cached_dmabuf_begin_cpu_access,
 	.end_cpu_access = histb_vdec_cached_dmabuf_end_cpu_access,
 	.release = histb_vdec_cached_dmabuf_release,
