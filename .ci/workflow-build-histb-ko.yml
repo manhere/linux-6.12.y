@@ -1,0 +1,238 @@
+name: Build histb kernel modules
+
+# Produces loadable .ko files for dvbip-1002 (6.12.115-dvbip-1002).
+#
+# Three things make the result actually loadable on the device:
+#   1. .ci/config-6.12.115-dvbip-1002 is the exact .config the running kernel
+#      was built with (pulled from the device), not a regenerated defconfig.
+#   2. .ci/Module.symvers is the Module.symvers shipped with that kernel, so
+#      modpost stamps the *device's* symbol CRCs into __kcrctab regardless of
+#      which compiler this runner uses.
+#   3. clang 19, matching the compiler in /proc/version. A few exported
+#      prototypes reach struct device, whose genksyms checksum depends on how
+#      the preprocessor expands compiler-conditional attributes; building with
+#      clang 18 shifted histb_vpss_get from 0x0f7b2f67 to 0xa05c9d21.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "module = build only the two histb dirs (fast); all = full make modules (slow, bulletproof)"
+        type: choice
+        options:
+          - module
+          - all
+        default: module
+      apply_patches:
+        description: "Apply .ci/patches/*.patch before building"
+        type: boolean
+        default: true
+# Deliberately no `push` trigger: this repo takes config/symvers updates as
+# commits, and a path filter on .ci/** would start a full build for every one
+# of them (and double up with the manual dispatch right after). Run it by hand.
+
+concurrency:
+  group: build-histb-ko-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  KERNEL_RELEASE: 6.12.115-dvbip-1002
+  # Set but empty on purpose. scripts/setlocalversion appends "-g<hash>" or "+"
+  # to the release string unless LOCALVERSION exists in the environment, and a
+  # wrong release string means the module's vermagic no longer matches.
+  LOCALVERSION: ""
+  MEDIA_DIR: drivers/media/platform/hisilicon
+  DRM_DIR: drivers/gpu/drm/hisilicon/histb
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout kernel tree
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev binutils-aarch64-linux-gnu \
+            kmod cpio rsync wget gnupg ca-certificates
+          # Prefer clang 19: the device kernel reports
+          # "Debian clang version 19.1.7 / Debian LLD 19.1.7".
+          if wget -q -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh \
+             && sudo /tmp/llvm.sh 19 && command -v clang-19 >/dev/null; then
+            echo "LLVM=-19" >> "$GITHUB_ENV"
+            echo "using clang-19"
+          else
+            sudo apt-get install -y --no-install-recommends clang lld llvm
+            echo "LLVM=1" >> "$GITHUB_ENV"
+            echo "::warning title=Compiler fallback::clang-19 unavailable, using distro clang; symbol CRCs may shift"
+          fi
+          echo "--- versions ---"
+          if [ "${LLVM}" = "-19" ]; then
+            clang-19 --version | head -1
+            ld.lld-19 --version | head -1
+          else
+            clang --version | head -1
+            ld.lld --version | head -1
+          fi
+
+      - name: Apply local patches
+        if: ${{ github.event.inputs.apply_patches != 'false' }}
+        run: |
+          shopt -s nullglob
+          patches=(.ci/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "no patches found"
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "==> $p"
+            if git apply --check --whitespace=nowarn "$p" 2>/dev/null; then
+              git apply --verbose --whitespace=nowarn "$p"
+            elif git apply --reverse --check "$p" 2>/dev/null; then
+              echo "    already applied upstream, skipping"
+            else
+              echo "    git apply unhappy, falling back to patch(1)"
+              patch -p1 --forward --batch < "$p"
+            fi
+          done
+          echo "--- resulting diff ---"
+          git diff --stat
+          echo "--- diag: dump_off in built source ---"
+          grep -n "dump_off" drivers/media/platform/hisilicon/histb-vdec-core.c | head -5 || echo "dump_off NOT in source"
+
+      - name: Configure from device .config
+        run: |
+          cp .ci/config-${KERNEL_RELEASE} .config
+          # The device build got its suffix from a localversion-* file; carry it
+          # in the config instead so kernel.release matches the running kernel.
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-dvbip-1002"/' .config
+          make ARCH=arm64 LLVM="${LLVM}" olddefconfig
+          grep -E '^CONFIG_(LOCALVERSION|MODVERSIONS|CC_IS_CLANG)=' .config
+
+      - name: Prepare build tree
+        run: |
+          make ARCH=arm64 LLVM="${LLVM}" -j"$(nproc)" modules_prepare
+          # modules_prepare alone does not always leave scripts/mod/modpost
+          # built; the M= build below needs it.
+          make ARCH=arm64 LLVM="${LLVM}" -j"$(nproc)" scripts
+          test -x scripts/mod/modpost && echo "modpost ok"
+
+      - name: Install on-device Module.symvers
+        run: |
+          # Authoritative CRCs of the running kernel: modpost reads this file
+          # from the tree root when it links modules.
+          cp .ci/Module.symvers Module.symvers
+          wc -l Module.symvers
+          echo "--- release check (must be ${KERNEL_RELEASE}) ---"
+          cat include/config/kernel.release
+          test "$(cat include/config/kernel.release)" = "${KERNEL_RELEASE}" || {
+            echo "::error::kernel.release mismatch, the module would not load"
+            exit 1
+          }
+
+      - name: Build modules
+        run: |
+          set -eux
+          scope="${{ github.event.inputs.scope }}"
+          : "${scope:=module}"
+          if [ "$scope" = "all" ]; then
+            make ARCH=arm64 LLVM="${LLVM}" -j"$(nproc)" modules
+          else
+            make ARCH=arm64 LLVM="${LLVM}" -j"$(nproc)" M="${MEDIA_DIR}" modules
+            make ARCH=arm64 LLVM="${LLVM}" -j"$(nproc)" M="${DRM_DIR}" modules
+          fi
+
+      - name: Collect and verify
+        run: |
+          set -eu
+          rm -rf dist && mkdir -p dist
+          find "${MEDIA_DIR}" "${DRM_DIR}" -name '*.ko' -exec cp {} dist/ \;
+          mapfile -t kos < <(find dist -name '*.ko' | sort)
+          if [ ${#kos[@]} -eq 0 ]; then echo "::error::no .ko produced"; exit 1; fi
+
+          expected="${KERNEL_RELEASE} SMP mod_unload modversions aarch64"
+          fail=0
+          echo "--- vermagic ---"
+          for ko in "${kos[@]}"; do
+            vm=$(modinfo -F vermagic "$ko")
+            printf '  %-26s %s\n' "$(basename "$ko")" "$vm"
+            if [ "$vm" != "$expected" ]; then
+              echo "::error file=$ko::vermagic '$vm' != '$expected'"
+              fail=1
+            fi
+          done
+
+          # Symbols our own modules export, so a locally computed CRC can be
+          # recognised as "replaced together with its importer".
+          for ko in "${kos[@]}"; do
+            nm "$ko"
+          done | awk '/__ksymtab_/ { sub(/.*__ksymtab_/, ""); print }' | sort -u > /tmp/own_exports.txt
+          echo "--- exported by this artifact: $(wc -l < /tmp/own_exports.txt) symbols ---"
+
+          awk -F'\t' 'NF >= 2 { print tolower($1) "\t" $2 }' .ci/Module.symvers > /tmp/device.syms
+
+          echo "--- symbol CRC check ---"
+          for ko in "${kos[@]}"; do
+            while read -r crc sym; do
+              [ -n "${sym:-}" ] || continue
+              want=$(awk -F'\t' -v s="$sym" '$2 == s { print $1 }' /tmp/device.syms)
+              if [ "$want" = "$crc" ]; then
+                continue
+              fi
+              if grep -qx "$sym" /tmp/own_exports.txt; then
+                # The exporter ships in the same artifact, so importer and
+                # exporter agree with each other even though the CRC differs
+                # from the device. Safe as long as nothing else imports it.
+                echo "::warning title=CRC differs::$(basename "$ko") imports $sym as $crc (device $want); exporter is in this artifact, replaced together"
+                continue
+              fi
+              echo "::error::$(basename "$ko"): CRC mismatch for '$sym' (built $crc, device ${want:-missing})"
+              fail=1
+            done < <(modprobe --dump-modversions "$ko" 2>/dev/null)
+          done
+          [ "$fail" -eq 0 ] && echo "OK: modules are compatible with the running kernel"
+          exit $fail
+
+      - name: Package
+        run: |
+          set -eux
+          cat > dist/install.sh <<'EOS'
+          #!/bin/sh
+          # Run on the dvbip-1002 box as root. Each .ko goes back to the path the
+          # shipped module already lives in, then depmod is refreshed.
+          set -e
+          cd "$(dirname "$0")"
+          DIR=/lib/modules/$(uname -r)/kernel
+          for ko in *.ko; do
+            dst=$(find "$DIR" -name "$ko" | head -n 1)
+            if [ -n "$dst" ]; then
+              cp -v "$ko" "$dst"
+            else
+              echo "skip $ko (no matching module under $DIR)"
+            fi
+          done
+          depmod -a
+          echo
+          echo "Stop E2 first (it holds /dev/video*), then reload:"
+          echo "  rmmod histb_vdec histb_vdp 2>/dev/null || true"
+          echo "  modprobe histb_vdec && modprobe histb-vdp"
+          EOS
+          chmod +x dist/install.sh
+          ( cd dist && sha256sum ./*.ko > SHA256SUMS.txt )
+          echo "--- artifact contents ---"
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: histb-ko-${{ env.KERNEL_RELEASE }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
